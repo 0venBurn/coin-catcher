@@ -1,15 +1,15 @@
 # AGENTS.md
 
-This project is a wow scaper and backtesting engine.
+## Docs
 
-It is currently a python3.13 project managed by uv.
+Read docs when they help current intent. Small/local work needs nearby files only. Broader/riskier work needs relevant docs and specs.
 
-When installing dependencies they should be run with the .venv and uv sync
+## Project Context
 
-Dependencies should be added with uv add.
+This project is a python scraper and backtesting with a small UI planned to run backetests
 
-Dependencies can be viewed in pyproject.toml
+Scraper can be found in /scraper directory.
 
-/docs contains information on testing, system patterns and conventions used in this project. Reference them when necessary.
+Backtesting can be found in /backtest directory
 
-/scraper contains the python scraping service
+Frontend app can be found in /app directory

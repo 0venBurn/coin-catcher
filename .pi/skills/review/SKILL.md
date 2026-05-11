@@ -28,7 +28,7 @@ Do not review the diff in isolation. Read the surrounding code to understand:
 - What invariants or assumptions does the broader system rely on?
 - How does data flow through the affected area?
 
-Also read `@docs/` to understand established patterns and conventions before evaluating whether changes conform to them. If `docs/` does not exist, note it and review against standard conventions for the detected stack.
+Also read `@docs/code` to understand established patterns and conventions before evaluating whether changes conform to them. If `docs/code` does not exist, note it and review against standard conventions for the detected stack.
 
 ### 3. Review — Critical issues only
 
@@ -57,6 +57,8 @@ Issue: What is wrong and why it matters.
 Severity: `HIGH`, `MEDIUM`, or `LOW`. Only include `LOW` when still critical enough to block/repair.
 
 If no critical issues are found, say so plainly. Do not pad the review.
+
+If no critical issues are found, say so plainly. Do not pad the review. Write this into a html report and place in @docs/reports with a meaningful name.
 
 ## Constraints
 

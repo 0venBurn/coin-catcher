@@ -11,7 +11,7 @@ Write focused tests that match user intent: TDD for new behavior, regression tes
 
 ### 1. Read testing conventions
 
-Read `@docs/testing.md` first. If `docs/testing.md` does not exist, note it and use standard conventions for the detected stack (e.g. pytest for Python, Jest/Vitest for TypeScript, built-in test runner for Go).
+Read `@docs/code/testing.md` first. If `docs/code/testing.md` does not exist, note it and use standard conventions for the detected stack (e.g. pytest for Python, Jest/Vitest for TypeScript, built-in test runner for Go).
 
 Do not write test code before understanding project test structure, utilities, naming, and commands.
 
@@ -32,7 +32,7 @@ Search for existing tests covering the subject. If found:
 - Extend existing tests before creating new files
 - Match existing style, setup, naming, and assertion patterns
 
-If no existing tests are found, create a new test file following `@docs/testing.md` or detected project convention.
+If no existing tests are found, create a new test file following `@docs/code/testing.md` or detected project convention.
 
 ### 4. Write focused tests
 
@@ -50,7 +50,7 @@ Keep tests focused on the requested behavior. Do not add broad unrelated coverag
 
 ### 5. Run tests
 
-Run tests using the command documented in `@docs/testing.md` or the closest project-specific command.
+Run tests using the command documented in `@docs/code/testing.md` or the closest project-specific command.
 
 Confirm result matches intent:
 
@@ -62,7 +62,7 @@ If result does not match intent, investigate and fix the test until it accuratel
 
 ### 6. Commit only when required
 
-If current workflow or human asks for commits, commit with a descriptive message following project convention. Check `@docs/conventions.md` if unsure.
+If current workflow or human asks for commits, commit with a descriptive message following project convention. Check `@docs/code/conventions.md` if unsure.
 
 Example:
 

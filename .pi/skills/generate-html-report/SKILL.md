@@ -5,4 +5,4 @@ description: Generate a report in html on findings or changes from the questions
 
 # Generate HTML Report
 
-Produce a HTML report based on the questions or changes asked for by the user. Make sure that it presents readable and with a logical flow that the person reading can be understand easily.
+Produce a HTML report based on the questions or changes asked for by the user. Make sure that it presents readable and with a logical flow that the person reading can be understand easily. Place it in the /docs/reports with meaningful name. If this does not exist place it in the root of the current director.
