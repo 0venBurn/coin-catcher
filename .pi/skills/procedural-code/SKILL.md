@@ -1,5 +1,5 @@
 ---
-name: improve-codebase
+name: procedural-code
 description: >
   Write, Refactor and improve codebases toward procedural, data-oriented, explicit programming styles
   rooted in systems programming philosophy. Use this skill whenever the user asks to write, refactor code,
