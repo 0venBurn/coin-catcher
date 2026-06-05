@@ -1,6 +1,6 @@
-def main():
-    print("Hello from scraper!")
+"""
+Main entry point for the WoW auction house scraper.
 
+This demonstrates how to use the async client to fetch auction data.
+"""
 
-if __name__ == "__main__":
-    main()
