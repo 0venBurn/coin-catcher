@@ -34,18 +34,6 @@ Examples:
 
 Read docs when they help current intent. Docs are organised as follows.
 
-/docs/code -> contains knowledge around system patterns, conventions and testing.
-
-- system_patterns.md shows architectural overviews on what happens in each service.
-- conventions.md considers the conventions for a project
-- testing.md considers the testing strategy for the variety of changes/ implementation
-
-/docs/adrs -> contain architectural design records for decisions made in the process
-
-/docs/reports -> contains specific html reports generated about research.
-
-/docs/prds -> contains product requirement docs around specific issues. Can be used in code reviews or when implementing.
-
 ## Project Context
 
 This project is a mono repo with directories for each part of the project.
