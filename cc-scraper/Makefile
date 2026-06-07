@@ -10,6 +10,9 @@ typecheck:
 	basedpyright src/
 
 install:
-	uv pip install -e .
+	uv sync
+
+run:
+	uv run scraper
 
 all: lint format typecheck
