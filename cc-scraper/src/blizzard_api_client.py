@@ -1,13 +1,10 @@
 # Std lib
-import asyncio
-import json
 import time
 
 # External
 import httpx
 
 # Project Imports
-from src import config
 from src.api_response_types import (
     CommodityAuction,
     CommodityAuctionsApiResponse,
@@ -15,11 +12,18 @@ from src.api_response_types import (
 )
 
 
-async def get_token(client: httpx.AsyncClient) -> tuple[str, float]:
+# Urls & Endpoints
+OAUTH_TOKEN_URL = "https://oauth.battle.net/token"
+BLIZZARD_ENDPOINTS = {"commodities": "/data/wow/auctions/commodities"}
+
+
+async def get_token(
+    client: httpx.AsyncClient, client_id: str, client_secret: str
+) -> tuple[str, float]:
     response = await client.post(
-        url=config.OAUTH_TOKEN_URL,
+        url=OAUTH_TOKEN_URL,
         data={"grant_type": "client_credentials"},
-        auth=(config.CLIENT_ID, config.CLIENT_SECRET),
+        auth=(client_id, client_secret),
     )
     response.raise_for_status()
     data: OAuthTokenResponse = response.json()
@@ -41,21 +45,3 @@ async def get_commodities(
     response.raise_for_status()
     data: CommodityAuctionsApiResponse = response.json()
     return data["auctions"]
-
-
-async def main():
-    async with httpx.AsyncClient() as client:
-        token, _ = await get_token(client)
-        region_info = config.BLIZZARD_URL_REGIONS_INFO["us"]
-        commodities = await get_commodities(
-            client,
-            region_info["url"],
-            config.BLIZZARD_ENDPOINTS["commodities"],
-            region_info["namespace"],
-            token,
-        )
-        print(json.dumps(commodities))
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
