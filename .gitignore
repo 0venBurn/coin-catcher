@@ -183,6 +183,11 @@ cython_debug/
 # Learn more at https://abstra.io/docs
 .abstra/
 
+# SvelteKit frontend source: the Python `lib/`/`lib64/` rules above would
+# otherwise swallow cc-app's `$lib` directory, which is application source.
+!cc-app/src/lib/
+!cc-app/src/lib/**
+
 # macOS
 .DS_Store
 
