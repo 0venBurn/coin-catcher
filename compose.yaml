@@ -1,0 +1,31 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: coin_catcher
+      POSTGRES_USER: coin_catcher
+      POSTGRES_PASSWORD: coin_catcher
+    ports:
+      - "5432:5432"
+    volumes:
+      - coin_catcher_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coin_catcher -d coin_catcher"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  scraper:
+    build: .
+    env_file:
+      - scraper/.env
+    environment:
+      DATABASE_URL: postgres://coin_catcher:coin_catcher@db:5432/coin_catcher?sslmode=disable
+      SCRAPE_ON_START: ${SCRAPE_ON_START:-false}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  coin_catcher_db:
