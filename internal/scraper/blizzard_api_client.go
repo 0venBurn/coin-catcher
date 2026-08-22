@@ -127,15 +127,11 @@ func (c *BlizzardClient) Region() string {
 	return c.region
 }
 
-// Ping verifies credentials and outbound connectivity by fetching an OAuth
-// token and issuing cheap requests against the region's API host, including
-// the token endpoint polled on every tick.
+// Ping verifies credentials and outbound connectivity against the region's
+// dynamic API host, including the token endpoint polled on every tick. The
+// static host is exercised moments later by the seeder.
 func (c *BlizzardClient) Ping(ctx context.Context) error {
 	if _, err := c.tokenFor(ctx); err != nil {
-		return err
-	}
-	var professions ProfessionIndexResponse
-	if err := c.getJSON(ctx, "/data/wow/profession/index", "static", nil, &professions); err != nil {
 		return err
 	}
 	var token TokenIndexResponse
@@ -147,15 +143,6 @@ func (c *BlizzardClient) GetTokenIndex(ctx context.Context) (TokenIndexResponse,
 	var payload TokenIndexResponse
 	err := c.getJSON(ctx, "/data/wow/token/index", "dynamic", nil, &payload)
 	return payload, err
-}
-
-func (c *BlizzardClient) GetCommodities(ctx context.Context, lastModified string) ([]CommodityAuction, string, bool, error) {
-	auctions := make([]CommodityAuction, 0)
-	modified, changed, _, err := c.StreamCommodities(ctx, lastModified, func(auction CommodityAuction) error {
-		auctions = append(auctions, auction)
-		return nil
-	})
-	return auctions, modified, changed, err
 }
 
 func (c *BlizzardClient) StreamCommodities(
