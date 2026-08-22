@@ -1,5 +1,10 @@
 package main
 
+// scraper entrypoint: wires logging, the database pool, reference-data
+// seeding, and the polling loop, then runs until SIGINT/SIGTERM or a fatal
+// error. Startup is deliberately sequential — config, database, schema,
+// seed, connectivity probe, poll — so each step proves its precondition
+// before the next begins.
 import (
 	"context"
 	"fmt"
@@ -15,6 +20,8 @@ import (
 )
 
 func main() {
+	// Text logs go to stdout; the container runtime owns capture and
+	// rotation, so nothing here writes to files.
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
 		logger.Error("scraper stopped", "error", err)
@@ -22,6 +29,10 @@ func main() {
 	}
 }
 
+// run performs startup in dependency order and blocks in the scrape loop
+// until the context is cancelled. Database connection retries up to 30 times
+// because the db container may still be running its own init when this one
+// starts, even with the compose healthcheck.
 func run(logger *slog.Logger) error {
 	config, err := scraper.LoadConfig()
 	if err != nil {
@@ -44,6 +55,8 @@ func run(logger *slog.Logger) error {
 			pool.Close()
 			pool = nil
 		}
+		// A failed New/Ping can leave a half-built pool behind; drop it so
+		// next attempt starts clean instead of leaking connections.
 		logger.Warn("database unavailable", "attempt", attempt, "error", err)
 		select {
 		case <-ctx.Done():
@@ -63,6 +76,8 @@ func run(logger *slog.Logger) error {
 	logger.Info("database schema ready")
 
 	httpClient := &http.Client{Timeout: config.RequestTimeout}
+	// One shared limiter across all regional clients keeps the combined
+	// request rate inside Blizzard's budget regardless of region count.
 	limiter := scraper.NewAPIRateLimiter(config.APIRequestsPerSecond)
 	clients := make([]*scraper.BlizzardClient, 0, len(config.Regions))
 	for _, region := range config.Regions {

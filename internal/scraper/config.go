@@ -10,6 +10,9 @@ import (
 	"time"
 )
 
+// Config is the fully resolved runtime configuration. Every field has a
+// default so the scraper can start with only credentials set; env overrides
+// exist for bounding runs and tuning throughput (see .env.example).
 type Config struct {
 	ClientID     string
 	ClientSecret string
@@ -32,6 +35,12 @@ type Schedule struct {
 	StopAt  time.Time // zero means unbounded
 }
 
+// LoadConfig reads configuration from the environment, after first loading
+// a .env file so local runs work without exporting variables by hand. The
+// .env lookup order supports both running from the repo root and from
+// internal/scraper; real environment variables always win over file values.
+// Validation errors are reported per variable with its name so misconfig
+// is fixable without reading source.
 func LoadConfig() (Config, error) {
 	envFile := os.Getenv("ENV_FILE")
 	if envFile == "" {
@@ -44,6 +53,9 @@ func LoadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("load %s: %w", envFile, err)
 	}
 
+	// Defaults chosen for one container polling two regions well under
+	// Blizzard's limits: 20 req/s matches the documented commodity cap,
+	// 2 minutes covers slow streaming commodity responses.
 	config := Config{
 		ClientID:             os.Getenv("CLIENT_ID"),
 		ClientSecret:         os.Getenv("CLIENT_SECRET"),
@@ -58,15 +70,15 @@ func LoadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("CLIENT_ID and CLIENT_SECRET are required")
 	}
 	var err error
-	pollStart, err := optionalDurationValue("POLL_START", 0)
+	pollStart, err := envDuration("POLL_START", 0, 0)
 	if err != nil {
 		return Config{}, err
 	}
-	pollEnd, err := optionalDurationValue("POLL_END", 0)
+	pollEnd, err := envDuration("POLL_END", 0, 0)
 	if err != nil {
 		return Config{}, err
 	}
-	if config.PollWindow, err = durationValue("POLL_WINDOW", config.PollWindow); err != nil {
+	if config.PollWindow, err = envDuration("POLL_WINDOW", config.PollWindow, time.Second); err != nil {
 		return Config{}, err
 	}
 	scrapeFrom, err := timeValue("SCRAPE_FROM")
@@ -108,6 +120,7 @@ func resolveSchedule(now time.Time, pollStart, pollEnd time.Duration, scrapeFrom
 	return Schedule{StartAt: startAt, StopAt: stopAt}
 }
 
+// valueOrDefault returns the env value or fallback when unset/empty.
 func valueOrDefault(name, fallback string) string {
 	if value := os.Getenv(name); value != "" {
 		return value
@@ -115,32 +128,21 @@ func valueOrDefault(name, fallback string) string {
 	return fallback
 }
 
-func durationValue(name string, fallback time.Duration) (time.Duration, error) {
+// envDuration parses a Go duration; empty/unset yields fallback. Values below
+// minimum are rejected (minimum 0 accepts zero as "no constraint").
+func envDuration(name string, fallback, minimum time.Duration) (time.Duration, error) {
 	value := os.Getenv(name)
 	if value == "" {
 		return fallback, nil
 	}
 	duration, err := time.ParseDuration(value)
-	if err != nil || duration <= 0 {
-		return 0, fmt.Errorf("%s must be a positive Go duration", name)
+	if err != nil || duration < minimum {
+		return 0, fmt.Errorf("%s must be a Go duration of at least %s", name, minimum)
 	}
 	return duration, nil
 }
 
-// optionalDurationValue parses a Go duration where zero is a valid value
-// ("0", empty, or unset all mean "no constraint").
-func optionalDurationValue(name string, fallback time.Duration) (time.Duration, error) {
-	value := os.Getenv(name)
-	if value == "" {
-		return fallback, nil
-	}
-	duration, err := time.ParseDuration(value)
-	if err != nil || duration < 0 {
-		return 0, fmt.Errorf("%s must be a non-negative Go duration", name)
-	}
-	return duration, nil
-}
-
+// timeValue parses an RFC3339 timestamp; empty/unset yields the zero time.
 func timeValue(name string) (time.Time, error) {
 	value := os.Getenv(name)
 	if value == "" {
@@ -153,6 +155,8 @@ func timeValue(name string) (time.Time, error) {
 	return parsed, nil
 }
 
+// intValue parses an integer clamped to [minimum, maximum]; empty/unset
+// yields fallback.
 func intValue(name string, fallback, minimum, maximum int) (int, error) {
 	value := os.Getenv(name)
 	if value == "" {
@@ -165,6 +169,10 @@ func intValue(name string, fallback, minimum, maximum int) (int, error) {
 	return parsed, nil
 }
 
+// loadDotEnv applies KEY=VALUE lines from path to the process environment.
+// Existing variables are never overwritten, matching dotenv convention so
+// explicit exports take precedence over file contents. Supports `export `
+// prefixes, comments, blank lines, and matched single/double quotes.
 func loadDotEnv(path string) error {
 	file, err := os.Open(path)
 	if err != nil {

@@ -5,17 +5,23 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/errgroup"
 )
 
+// recipeSeedBatchSize bounds both the in-flight result buffer and the
+// commit batch: workers never block on results until a full batch is ready,
+// and each flush stays a modest transaction.
 const recipeSeedBatchSize = 500
 
+// recipeSeedRecord pairs a recipe detail response with the hierarchy job it
+// was fetched for, so batches know where each recipe belongs.
 type recipeSeedRecord struct {
 	job    recipeJob
 	recipe RecipeResponse
 }
 
+// recipeJob identifies one recipe plus its place in the profession → tier →
+// category tree, discovered during the listing pass.
 type recipeJob struct {
 	professionID int
 	tierID       int
@@ -23,11 +29,19 @@ type recipeJob struct {
 	recipeID     int
 }
 
+// recipeFetchResult carries either a fetched recipe or the error that ended
+// its worker; errors travel through the same channel so the consumer can
+// drain cleanly before unwinding.
 type recipeFetchResult struct {
 	record recipeSeedRecord
 	err    error
 }
 
+// seedRecipesAndReagents runs the final seed stage in two phases: a serial
+// listing pass builds the tier/category hierarchy and the deduped job list,
+// then a bounded worker pool fetches recipe details while the main goroutine
+// commits them in batches. Recipes listed under several categories are kept
+// once under their first sighting because recipes table keys on id+faction.
 func (s *Seeder) seedRecipesAndReagents(ctx context.Context) error {
 	s.log.Info("seeding recipes and reagents", "batch_size", recipeSeedBatchSize, "workers", s.recipeWorkers)
 	professions, err := s.client.GetProfessions(ctx)
@@ -142,6 +156,9 @@ func (s *Seeder) seedRecipesAndReagents(ctx context.Context) error {
 	var fetchErr error
 	for result := range results {
 		if result.err != nil {
+			// Keep only the first fetch error; later ones are duplicates of
+			// the same unwind. Draining continues so no worker blocks on a
+			// full results channel.
 			if fetchErr == nil {
 				fetchErr = result.err
 			}
@@ -170,50 +187,34 @@ func (s *Seeder) seedRecipesAndReagents(ctx context.Context) error {
 	return s.markCompleted(ctx, "reagents", reagentCount)
 }
 
+// storeRecipeHierarchy commits tiers and categories ahead of any recipe
+// batch, so every recipe row can reference existing parents on insert.
 func (s *Seeder) storeRecipeHierarchy(ctx context.Context, tierRows, categoryRows [][]any) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `
-		CREATE TEMP TABLE staged_tier_details (
-			profession_id INTEGER, id INTEGER, name TEXT,
-			minimum_skill_level INTEGER, maximum_skill_level INTEGER
-		) ON COMMIT DROP;
-		CREATE TEMP TABLE staged_categories (
-			profession_id INTEGER, skill_tier_id INTEGER, name TEXT
-		) ON COMMIT DROP;`); err != nil {
-		return fmt.Errorf("create recipe hierarchy staging tables: %w", err)
-	}
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged_tier_details"},
-		[]string{"profession_id", "id", "name", "minimum_skill_level", "maximum_skill_level"},
-		pgx.CopyFromRows(tierRows)); err != nil {
-		return fmt.Errorf("copy staged tier details: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO profession_skill_tiers
-		(profession_id, id, name, minimum_skill_level, maximum_skill_level)
-		SELECT profession_id, id, name, minimum_skill_level, maximum_skill_level FROM staged_tier_details
-		ON CONFLICT (profession_id, id) DO UPDATE SET name=EXCLUDED.name,
-		minimum_skill_level=EXCLUDED.minimum_skill_level,
-		maximum_skill_level=EXCLUDED.maximum_skill_level
-		WHERE (profession_skill_tiers.name, profession_skill_tiers.minimum_skill_level,
-			profession_skill_tiers.maximum_skill_level)
-		IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.minimum_skill_level,
-			EXCLUDED.maximum_skill_level)`); err != nil {
-		return fmt.Errorf("upsert staged tier details: %w", err)
-	}
-	if len(categoryRows) > 0 {
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged_categories"},
-			[]string{"profession_id", "skill_tier_id", "name"}, pgx.CopyFromRows(categoryRows)); err != nil {
-			return fmt.Errorf("copy staged categories: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO profession_categories
-			(profession_id, skill_tier_id, name)
-			SELECT profession_id, skill_tier_id, name FROM staged_categories
-			ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("upsert staged categories: %w", err)
-		}
+	err = execStagedLoads(ctx, tx, []stagedLoad{
+		{
+			label:   "staged tier details",
+			table:   "staged_tier_details",
+			create:  createStagedTierDetails,
+			columns: colsStagedTierDetails,
+			rows:    tierRows,
+			upsert:  upsertProfessionSkillTier,
+		},
+		{
+			label:   "staged categories",
+			table:   "staged_categories",
+			create:  createStagedCategories,
+			columns: colsStagedCategories,
+			rows:    categoryRows,
+			upsert:  insertProfessionCategory,
+		},
+	})
+	if err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit recipe hierarchy: %w", err)
@@ -222,11 +223,17 @@ func (s *Seeder) storeRecipeHierarchy(ctx context.Context, tierRows, categoryRow
 	return nil
 }
 
+// recipeVariant is one faction-specific row of a recipe: either the neutral
+// form or one side of an Alliance/Horde pair.
 type recipeVariant struct {
 	faction       string
 	craftedItemID any
 }
 
+// recipeVariants expands one recipe into its faction rows: neutral-only,
+// or an Alliance/Horde pair with distinct crafted items. The mixed and
+// half-faction shapes have never been observed upstream but would silently
+// corrupt the faction keying if stored naively, hence the hard errors.
 func recipeVariants(recipe RecipeResponse) ([]recipeVariant, error) {
 	hasGeneric := recipe.CraftedItem != nil
 	hasAlliance := recipe.AllianceCraftedItem != nil
@@ -263,6 +270,11 @@ type slotKey struct {
 	slotTypeID int
 }
 
+// storeRecipeBatch flattens a batch of recipes into four staged loads.
+// Reagents and slots are keyed maps so a reagent appearing as both optional
+// and required (or duplicated across variants) collapses to one row, with
+// required winning over optional for the same key. Item stubs commit first
+// so recipe/reagent foreign keys resolve within the same transaction.
 func (s *Seeder) storeRecipeBatch(ctx context.Context, records []recipeSeedRecord) (int, int, error) {
 	itemReferences := make(map[int]string)
 	recipeRows := make([][]any, 0, len(records))
@@ -311,6 +323,8 @@ func (s *Seeder) storeRecipeBatch(ctx context.Context, records []recipeSeedRecor
 			}
 			for _, reagent := range recipe.OptionalReagents {
 				key := reagentKey{recipe.ID, variant.faction, reagent.Reagent.ID}
+				// Required reagents already present must not be downgraded to
+				// optional when the same item also appears in the optional list.
 				if _, required := reagentRows[key]; !required {
 					reagentRows[key] = []any{recipe.ID, variant.faction, reagent.Reagent.ID, reagent.Quantity, true}
 				}
@@ -341,89 +355,42 @@ func (s *Seeder) storeRecipeBatch(ctx context.Context, records []recipeSeedRecor
 	}
 	defer tx.Rollback(ctx)
 
-	const stagingTables = `
-CREATE TEMP TABLE staged_items (id INTEGER, name TEXT) ON COMMIT DROP;
-CREATE TEMP TABLE staged_recipes (
-	id INTEGER, faction TEXT, name TEXT, description TEXT, rank INTEGER, media_id INTEGER,
-	profession_id INTEGER, skill_tier_id INTEGER, category_name TEXT,
-	crafted_item_id INTEGER, crafted_quantity DOUBLE PRECISION
-) ON COMMIT DROP;
-CREATE TEMP TABLE staged_reagents (
-	recipe_id INTEGER, recipe_faction TEXT, item_id INTEGER, quantity INTEGER, optional BOOLEAN
-) ON COMMIT DROP;
-CREATE TEMP TABLE staged_slots (
-	recipe_id INTEGER, recipe_faction TEXT, slot_type_id INTEGER, display_order INTEGER
-) ON COMMIT DROP;`
-	if _, err := tx.Exec(ctx, stagingTables); err != nil {
-		return 0, 0, fmt.Errorf("create recipe staging tables: %w", err)
-	}
-
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged_items"}, []string{"id", "name"}, pgx.CopyFromRows(itemRows)); err != nil {
-		return 0, 0, fmt.Errorf("copy staged items: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO items
-		(id, name, item_class, item_subclass, quality, is_equippable, is_stackable, metadata_complete)
-		SELECT id, name, 'Unknown', 'Unknown', 'Unknown', FALSE, FALSE, FALSE FROM staged_items
-		ON CONFLICT (id) DO NOTHING`); err != nil {
-		return 0, 0, fmt.Errorf("upsert staged items: %w", err)
-	}
-
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged_recipes"},
-		[]string{"id", "faction", "name", "description", "rank", "media_id", "profession_id",
-			"skill_tier_id", "category_name", "crafted_item_id", "crafted_quantity"},
-		pgx.CopyFromRows(recipeRows)); err != nil {
-		return 0, 0, fmt.Errorf("copy staged recipes: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO recipes
-		(id, faction, name, description, rank, media_id, profession_id, skill_tier_id,
-		 category_name, crafted_item_id, crafted_quantity, updated_at)
-		SELECT id, faction, name, description, rank, media_id, profession_id, skill_tier_id,
-		 category_name, crafted_item_id, crafted_quantity, NOW() FROM staged_recipes
-		ON CONFLICT (id, faction) DO UPDATE SET name=EXCLUDED.name,
-		description=EXCLUDED.description, rank=EXCLUDED.rank, media_id=EXCLUDED.media_id,
-		profession_id=EXCLUDED.profession_id, skill_tier_id=EXCLUDED.skill_tier_id,
-		category_name=EXCLUDED.category_name, crafted_item_id=EXCLUDED.crafted_item_id,
-		crafted_quantity=EXCLUDED.crafted_quantity, updated_at=NOW()
-		WHERE (recipes.name, recipes.description, recipes.rank, recipes.media_id,
-			recipes.profession_id, recipes.skill_tier_id, recipes.category_name,
-			recipes.crafted_item_id, recipes.crafted_quantity)
-		IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.description, EXCLUDED.rank, EXCLUDED.media_id,
-			EXCLUDED.profession_id, EXCLUDED.skill_tier_id, EXCLUDED.category_name,
-			EXCLUDED.crafted_item_id, EXCLUDED.crafted_quantity)`); err != nil {
-		return 0, 0, fmt.Errorf("upsert staged recipes: %w", err)
-	}
-
-	if len(reagents) > 0 {
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged_reagents"},
-			[]string{"recipe_id", "recipe_faction", "item_id", "quantity", "optional"},
-			pgx.CopyFromRows(reagents)); err != nil {
-			return 0, 0, fmt.Errorf("copy staged reagents: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO reagents
-			(recipe_id, recipe_faction, item_id, quantity, optional)
-			SELECT recipe_id, recipe_faction, item_id, quantity, optional FROM staged_reagents
-			ON CONFLICT (recipe_id, recipe_faction, item_id) DO UPDATE SET
-			quantity=EXCLUDED.quantity, optional=EXCLUDED.optional
-			WHERE (reagents.quantity, reagents.optional)
-			IS DISTINCT FROM (EXCLUDED.quantity, EXCLUDED.optional)`); err != nil {
-			return 0, 0, fmt.Errorf("upsert staged reagents: %w", err)
-		}
-	}
-
-	if len(slots) > 0 {
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged_slots"},
-			[]string{"recipe_id", "recipe_faction", "slot_type_id", "display_order"},
-			pgx.CopyFromRows(slots)); err != nil {
-			return 0, 0, fmt.Errorf("copy staged crafting slots: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO modified_crafting_slots
-			(recipe_id, recipe_faction, slot_type_id, display_order)
-			SELECT recipe_id, recipe_faction, slot_type_id, display_order FROM staged_slots
-			ON CONFLICT (recipe_id, recipe_faction, slot_type_id) DO UPDATE SET
-			display_order=EXCLUDED.display_order
-			WHERE modified_crafting_slots.display_order IS DISTINCT FROM EXCLUDED.display_order`); err != nil {
-			return 0, 0, fmt.Errorf("upsert staged crafting slots: %w", err)
-		}
+	err = execStagedLoads(ctx, tx, []stagedLoad{
+		{
+			label:   "staged items",
+			table:   "staged_items",
+			create:  createStagedItems,
+			columns: colsStagedItems,
+			rows:    itemRows,
+			upsert:  insertItemStub,
+		},
+		{
+			label:   "staged recipes",
+			table:   "staged_recipes",
+			create:  createStagedRecipes,
+			columns: colsStagedRecipes,
+			rows:    recipeRows,
+			upsert:  upsertRecipe,
+		},
+		{
+			label:   "staged reagents",
+			table:   "staged_reagents",
+			create:  createStagedReagents,
+			columns: colsStagedReagents,
+			rows:    reagents,
+			upsert:  upsertReagent,
+		},
+		{
+			label:   "staged slots",
+			table:   "staged_slots",
+			create:  createStagedSlots,
+			columns: colsStagedSlots,
+			rows:    slots,
+			upsert:  upsertModifiedCraftingSlot,
+		},
+	})
+	if err != nil {
+		return 0, 0, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {

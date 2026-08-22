@@ -10,6 +10,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Scraper runs the continuous polling loop over all regional clients,
+// committing snapshots transactionally as upstream data changes.
 type Scraper struct {
 	pool       *pgxpool.Pool
 	clients    []*BlizzardClient
@@ -18,6 +20,8 @@ type Scraper struct {
 	pollWindow time.Duration
 }
 
+// NewScraper wires the polling loop; schedule and pollWindow come from
+// configuration so runs can be bounded in production without code changes.
 func NewScraper(pool *pgxpool.Pool, clients []*BlizzardClient, logger *slog.Logger, config Config) *Scraper {
 	return &Scraper{
 		pool: pool, clients: clients, log: logger,
@@ -209,6 +213,9 @@ func logTime(t time.Time) any {
 	return t
 }
 
+// snapshotCopyBatchSize is the streaming COPY batch size: large enough that
+// per-batch round trips are negligible for ~200k auctions, small enough that
+// one buffered batch stays a few MB.
 const snapshotCopyBatchSize = 10_000
 
 // storedSnapshot reports a committed commodity snapshot; the zero-value
@@ -220,8 +227,11 @@ type storedSnapshot struct {
 
 // storeStreamedSnapshot fetches commodities with If-Modified-Since and copies
 // any new auctions into auction_snapshots together with the scraper_state
-// last_modified update, all in one transaction. Returns nil when nothing
-// changed.
+// last_modified update, all in one transaction — so the state pointer never
+// advertises data that failed to commit, and a crash mid-snapshot leaves no
+// half-written rows. Returns nil when nothing changed. The transaction is
+// opened lazily on first flush because an unchanged 304 must not hold one
+// open at all.
 func (s *Scraper) storeStreamedSnapshot(ctx context.Context, client *BlizzardClient, lastModified string) (*storedSnapshot, error) {
 	region := client.region
 	snapshotTime := time.Now().UTC()
@@ -245,6 +255,8 @@ func (s *Scraper) storeStreamedSnapshot(ctx context.Context, client *BlizzardCli
 	}
 
 	batch := make([]CommodityAuction, 0, snapshotCopyBatchSize)
+	// flush copies the pending batch and resets it; reusing the slice keeps
+	// allocation flat across hundreds of thousands of auctions.
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil

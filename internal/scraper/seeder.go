@@ -9,6 +9,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Seeder populates reference data (items, professions, recipes, reagents)
+// idempotently before polling starts. Progress is tracked per stage in
+// seeder_status so a crashed seed resumes instead of restarting.
 type Seeder struct {
 	pool          *pgxpool.Pool
 	client        *BlizzardClient
@@ -16,6 +19,8 @@ type Seeder struct {
 	recipeWorkers int
 }
 
+// NewSeeder builds the seeder; recipeWorkers bounds the concurrent recipe
+// detail fetches during the final stage (defaulting to 5 when non-positive).
 func NewSeeder(pool *pgxpool.Pool, client *BlizzardClient, logger *slog.Logger, recipeWorkers int) *Seeder {
 	if recipeWorkers <= 0 {
 		recipeWorkers = 5
@@ -23,49 +28,55 @@ func NewSeeder(pool *pgxpool.Pool, client *BlizzardClient, logger *slog.Logger, 
 	return &Seeder{pool: pool, client: client, log: logger, recipeWorkers: recipeWorkers}
 }
 
+// Run executes the seed stages in order; each stage lists the seeder_status
+// rows it completes (recipes and reagents share one run).
 func (s *Seeder) Run(ctx context.Context) error {
-	itemsDone, err := s.completed(ctx, "items")
-	if err != nil {
-		return err
+	stages := []struct {
+		names []string
+		run   func(context.Context) error
+	}{
+		{[]string{"items"}, s.seedItems},
+		{[]string{"professions"}, s.seedProfessions},
+		{[]string{"recipes", "reagents"}, s.seedRecipesAndReagents},
 	}
-	if !itemsDone {
-		if err := s.seedItems(ctx); err != nil {
-			s.recordError(ctx, "items", err)
+	for _, stage := range stages {
+		done, err := s.allCompleted(ctx, stage.names)
+		if err != nil {
 			return err
 		}
-	}
-
-	professionsDone, err := s.completed(ctx, "professions")
-	if err != nil {
-		return err
-	}
-	if !professionsDone {
-		if err := s.seedProfessions(ctx); err != nil {
-			s.recordError(ctx, "professions", err)
-			return err
+		if done {
+			continue
 		}
-	}
-
-	recipesDone, err := s.completed(ctx, "recipes")
-	if err != nil {
-		return err
-	}
-	reagentsDone, err := s.completed(ctx, "reagents")
-	if err != nil {
-		return err
-	}
-	if !recipesDone || !reagentsDone {
-		if err := s.seedRecipesAndReagents(ctx); err != nil {
-			s.recordError(ctx, "recipes", err)
-			s.recordError(ctx, "reagents", err)
+		if err := stage.run(ctx); err != nil {
+			for _, name := range stage.names {
+				s.recordError(ctx, name, err)
+			}
 			return err
 		}
 	}
 	return nil
 }
 
+// allCompleted reports whether every named seeder_status row is complete.
+func (s *Seeder) allCompleted(ctx context.Context, names []string) (bool, error) {
+	for _, name := range names {
+		completed, err := s.completed(ctx, name)
+		if err != nil || !completed {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// itemSeedBatchSize is how many item rows accumulate before a staged
+// upsert commits; bounded batches keep transactions and memory small while
+// scanning hundreds of thousands of items.
 const itemSeedBatchSize = 10_000
 
+// seedItems scans the search endpoint in id order until exhausted, staging
+// rows and committing them in batches. startingID always advances to
+// lastID+1 rather than trusting page size, so gaps or reordering upstream
+// cannot loop forever.
 func (s *Seeder) seedItems(ctx context.Context) error {
 	s.log.Info("seeding items", "batch_size", itemSeedBatchSize)
 	startingID, total, lastID := 1, 0, 0
@@ -79,41 +90,16 @@ func (s *Seeder) seedItems(ctx context.Context) error {
 			return err
 		}
 		defer tx.Rollback(ctx)
-		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE staged_item_seed (
-			id INTEGER, name TEXT, item_level INTEGER, item_class TEXT, item_subclass TEXT,
-			inventory_type TEXT, quality TEXT, is_equippable BOOLEAN, is_stackable BOOLEAN,
-			required_level INTEGER, sell_price INTEGER, max_stack_size INTEGER
-		) ON COMMIT DROP`); err != nil {
-			return fmt.Errorf("create item staging table: %w", err)
-		}
-		columns := []string{"id", "name", "item_level", "item_class", "item_subclass", "inventory_type",
-			"quality", "is_equippable", "is_stackable", "required_level", "sell_price", "max_stack_size"}
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged_item_seed"}, columns, pgx.CopyFromRows(rows)); err != nil {
-			return fmt.Errorf("copy staged items: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO items
-			(id, name, item_level, item_class, item_subclass, inventory_type, quality,
-			 is_equippable, is_stackable, required_level, sell_price, max_stack_size,
-			 metadata_complete, updated_at)
-			SELECT id, name, item_level, item_class, item_subclass, inventory_type, quality,
-			 is_equippable, is_stackable, required_level, sell_price, max_stack_size, TRUE, NOW()
-			FROM staged_item_seed
-			ON CONFLICT (id) DO UPDATE SET
-			name=EXCLUDED.name, item_level=EXCLUDED.item_level, item_class=EXCLUDED.item_class,
-			item_subclass=EXCLUDED.item_subclass, inventory_type=EXCLUDED.inventory_type,
-			quality=EXCLUDED.quality, is_equippable=EXCLUDED.is_equippable,
-			is_stackable=EXCLUDED.is_stackable, required_level=EXCLUDED.required_level,
-			sell_price=EXCLUDED.sell_price, max_stack_size=EXCLUDED.max_stack_size,
-			metadata_complete=TRUE, updated_at=NOW()
-			WHERE (items.name, items.item_level, items.item_class, items.item_subclass,
-				items.inventory_type, items.quality, items.is_equippable, items.is_stackable,
-				items.required_level, items.sell_price, items.max_stack_size, items.metadata_complete)
-			IS DISTINCT FROM
-				(EXCLUDED.name, EXCLUDED.item_level, EXCLUDED.item_class, EXCLUDED.item_subclass,
-				 EXCLUDED.inventory_type, EXCLUDED.quality, EXCLUDED.is_equippable,
-				 EXCLUDED.is_stackable, EXCLUDED.required_level, EXCLUDED.sell_price,
-				 EXCLUDED.max_stack_size, TRUE)`); err != nil {
-			return fmt.Errorf("upsert staged items: %w", err)
+		err = execStagedLoads(ctx, tx, []stagedLoad{{
+			label:   "staged items",
+			table:   "staged_item_seed",
+			create:  createStagedItemSeed,
+			columns: colsStagedItemSeed,
+			rows:    rows,
+			upsert:  upsertItemMetadata,
+		}})
+		if err != nil {
+			return err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return fmt.Errorf("commit item batch: %w", err)
@@ -134,6 +120,8 @@ func (s *Seeder) seedItems(ctx context.Context) error {
 		}
 		for _, result := range page.Results {
 			item := result.Data
+			// inventoryType is nullable upstream; typed nil keeps the COPY
+			// column NULL instead of the string "<nil>".
 			var inventoryType any
 			if item.InventoryType != nil {
 				inventoryType = item.InventoryType.Name.English()
@@ -160,6 +148,10 @@ func (s *Seeder) seedItems(ctx context.Context) error {
 	return s.markCompleted(ctx, "items", total)
 }
 
+// seedProfessions loads every profession plus its skill tiers in one pass.
+// tierRows is pre-sized generously because most professions have on the
+// order of a dozen tiers; both tables commit in a single transaction so
+// tiers never reference a missing profession.
 func (s *Seeder) seedProfessions(ctx context.Context) error {
 	s.log.Info("seeding professions")
 	professions, err := s.client.GetProfessions(ctx)
@@ -190,41 +182,26 @@ func (s *Seeder) seedProfessions(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `
-		CREATE TEMP TABLE staged_professions (
-			id INTEGER, name TEXT, description TEXT, type_code TEXT, type_name TEXT, media_id INTEGER
-		) ON COMMIT DROP;
-		CREATE TEMP TABLE staged_profession_tiers (
-			profession_id INTEGER, id INTEGER, name TEXT
-		) ON COMMIT DROP;`); err != nil {
-		return fmt.Errorf("create profession staging tables: %w", err)
-	}
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged_professions"},
-		[]string{"id", "name", "description", "type_code", "type_name", "media_id"},
-		pgx.CopyFromRows(professionRows)); err != nil {
-		return fmt.Errorf("copy staged professions: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO professions
-		(id, name, description, type_code, type_name, media_id, updated_at)
-		SELECT id, name, description, type_code, type_name, media_id, NOW() FROM staged_professions
-		ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description,
-		type_code=EXCLUDED.type_code, type_name=EXCLUDED.type_name,
-		media_id=EXCLUDED.media_id, updated_at=NOW()
-		WHERE (professions.name, professions.description, professions.type_code,
-			professions.type_name, professions.media_id)
-		IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.description, EXCLUDED.type_code,
-			EXCLUDED.type_name, EXCLUDED.media_id)`); err != nil {
-		return fmt.Errorf("upsert staged professions: %w", err)
-	}
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"staged_profession_tiers"},
-		[]string{"profession_id", "id", "name"}, pgx.CopyFromRows(tierRows)); err != nil {
-		return fmt.Errorf("copy staged profession tiers: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO profession_skill_tiers (profession_id, id, name)
-		SELECT profession_id, id, name FROM staged_profession_tiers
-		ON CONFLICT (profession_id, id) DO UPDATE SET name=EXCLUDED.name
-		WHERE profession_skill_tiers.name IS DISTINCT FROM EXCLUDED.name`); err != nil {
-		return fmt.Errorf("upsert staged profession tiers: %w", err)
+	err = execStagedLoads(ctx, tx, []stagedLoad{
+		{
+			label:   "staged professions",
+			table:   "staged_professions",
+			create:  createStagedProfessions,
+			columns: colsStagedProfessions,
+			rows:    professionRows,
+			upsert:  upsertProfession,
+		},
+		{
+			label:   "staged profession tiers",
+			table:   "staged_profession_tiers",
+			create:  createStagedProfessionTiers,
+			columns: colsStagedProfessionTiers,
+			rows:    tierRows,
+			upsert:  upsertProfessionTier,
+		},
+	})
+	if err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit profession batch: %w", err)
@@ -232,6 +209,8 @@ func (s *Seeder) seedProfessions(ctx context.Context) error {
 	return s.markCompleted(ctx, "professions", len(professions))
 }
 
+// completed reports whether the named seeder already finished; ErrNoRows
+// means "never run", which counts as not complete.
 func (s *Seeder) completed(ctx context.Context, name string) (bool, error) {
 	var completed bool
 	err := s.pool.QueryRow(ctx, `SELECT completed FROM seeder_status WHERE seeder_type=$1`, name).Scan(&completed)
@@ -247,6 +226,8 @@ func (s *Seeder) completed(ctx context.Context, name string) (bool, error) {
 	return completed, nil
 }
 
+// markCompleted records success with the processed count, clearing any
+// previous last_error in the same statement.
 func (s *Seeder) markCompleted(ctx context.Context, name string, count int) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO seeder_status
 		(seeder_type, completed, completed_at, records_processed, last_error, updated_at)
@@ -258,6 +239,9 @@ func (s *Seeder) markCompleted(ctx context.Context, name string, count int) erro
 	return err
 }
 
+// recordError persists the failure reason for observability; a failure to
+// even record it is logged but must not mask the original seed error, so
+// seedErr keeps propagating via the caller's return.
 func (s *Seeder) recordError(ctx context.Context, name string, seedErr error) {
 	_, err := s.pool.Exec(ctx, `INSERT INTO seeder_status
 		(seeder_type, completed, last_error, updated_at) VALUES ($1,FALSE,$2,NOW())

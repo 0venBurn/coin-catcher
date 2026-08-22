@@ -15,12 +15,18 @@ import (
 
 const OAuthTokenURL = "https://oauth.battle.net/token"
 
+// APIRateLimiter spaces requests evenly at a fixed requests-per-second pace.
+// Blizzard throttles by request rate, so a steady drip avoids bursts that a
+// naive ticker-with-sleep would produce under concurrent callers.
 type APIRateLimiter struct {
 	mu       sync.Mutex
 	interval time.Duration
-	next     time.Time
+	next     time.Time // earliest slot not yet handed out; zero means "now"
 }
 
+// NewAPIRateLimiter builds a limiter for the given per-second budget, falling
+// back to 20 req/s (Blizzard's documented commodity cap) when configured to
+// zero or below.
 func NewAPIRateLimiter(requestsPerSecond int) *APIRateLimiter {
 	if requestsPerSecond <= 0 {
 		requestsPerSecond = 20
@@ -28,6 +34,10 @@ func NewAPIRateLimiter(requestsPerSecond int) *APIRateLimiter {
 	return &APIRateLimiter{interval: time.Second / time.Duration(requestsPerSecond)}
 }
 
+// Wait blocks until the caller's reserved slot arrives, reserving slots in
+// arrival order so concurrency cannot reorder the pacing. The lock is held
+// only for reservation; sleeping happens outside it so one slow caller never
+// delays later reservations.
 func (l *APIRateLimiter) Wait(ctx context.Context) error {
 	l.mu.Lock()
 	now := time.Now()
@@ -52,6 +62,9 @@ func (l *APIRateLimiter) Wait(ctx context.Context) error {
 	}
 }
 
+// BlizzardClient is an authenticated, rate-limited client for one region of
+// the WoW game-data APIs. It caches its OAuth token and shares the limiter
+// with sibling regional clients so the combined request rate stays in budget.
 type BlizzardClient struct {
 	http         *http.Client
 	clientID     string
@@ -59,11 +72,13 @@ type BlizzardClient struct {
 	region       string
 	apiHost      string
 	limiter      *APIRateLimiter
-	token        string
-	tokenExpires time.Time
+	token        string    // cached OAuth bearer token
+	tokenExpires time.Time // refreshed one minute early (see tokenFor)
 	mu           sync.Mutex
 }
 
+// NewBlizzardClient builds the client for a region; each region has its own
+// apiHost because Blizzard namespaces data per region.
 func NewBlizzardClient(httpClient *http.Client, clientID, clientSecret, region string, limiter *APIRateLimiter) *BlizzardClient {
 	return &BlizzardClient{
 		http: httpClient, clientID: clientID, clientSecret: clientSecret,
@@ -71,6 +86,11 @@ func NewBlizzardClient(httpClient *http.Client, clientID, clientSecret, region s
 	}
 }
 
+// tokenFor returns a valid bearer token, requesting a new one only when the
+// cached token is missing or within a minute of expiring. The early refresh
+// margin keeps in-flight requests from failing on a token that expires
+// between fetch and use. Callers serialize behind the mutex because OAuth is
+// per-client, not per-request.
 func (c *BlizzardClient) tokenFor(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -100,6 +120,10 @@ func (c *BlizzardClient) tokenFor(ctx context.Context) (string, error) {
 	return c.token, nil
 }
 
+// apiRequest issues one authenticated call against the region's dynamic or
+// static namespace. A non-empty lastModified is sent as If-Modified-Since so
+// unchanged endpoints answer 304 without a body — the core bandwidth saver
+// for commodity polling.
 func (c *BlizzardClient) apiRequest(ctx context.Context, method, path, namespace string, query url.Values, lastModified string) (*http.Response, error) {
 	token, err := c.tokenFor(ctx)
 	if err != nil {
@@ -131,11 +155,8 @@ func (c *BlizzardClient) Region() string {
 // dynamic API host, including the token endpoint polled on every tick. The
 // static host is exercised moments later by the seeder.
 func (c *BlizzardClient) Ping(ctx context.Context) error {
-	if _, err := c.tokenFor(ctx); err != nil {
-		return err
-	}
-	var token TokenIndexResponse
-	return c.getJSON(ctx, "/data/wow/token/index", "dynamic", nil, &token)
+	_, err := c.GetTokenIndex(ctx)
+	return err
 }
 
 // GetTokenIndex fetches the current WoW Token price for the region.
@@ -145,6 +166,12 @@ func (c *BlizzardClient) GetTokenIndex(ctx context.Context) (TokenIndexResponse,
 	return payload, err
 }
 
+// StreamCommodities fetches the region-wide commodity auction list and hands
+// each auction to consume as it decodes, so peak memory stays flat no matter
+// how large the list grows. Returns (lastModified, changed, count): changed
+// is false for a 304 or any response whose Last-Modified equals what was
+// sent. The hand-rolled token loop exists because decoding the full payload
+// into memory first would double the container's footprint on busy regions.
 func (c *BlizzardClient) StreamCommodities(
 	ctx context.Context,
 	lastModified string,
@@ -212,6 +239,9 @@ func (c *BlizzardClient) StreamCommodities(
 	return modified, true, count, nil
 }
 
+// SearchItems returns one page of items ordered by id starting at
+// startingID; the open-ended "[%d,]" range plus _page=1 turns the search
+// endpoint into an id-ordered scan suitable for exhaustive seeding.
 func (c *BlizzardClient) SearchItems(ctx context.Context, startingID, pageSize int) (ItemSearchResponse, error) {
 	query := url.Values{
 		"id":        {fmt.Sprintf("[%d,]", startingID)},
@@ -245,18 +275,13 @@ func (c *BlizzardClient) GetSkillTier(ctx context.Context, professionID, tierID 
 }
 
 func (c *BlizzardClient) GetRecipe(ctx context.Context, id int) (RecipeResponse, error) {
-	response, err := c.apiRequest(ctx, http.MethodGet, fmt.Sprintf("/data/wow/recipe/%d", id), "static", nil, "")
-	if err != nil {
-		return RecipeResponse{}, err
-	}
-	defer response.Body.Close()
 	var payload RecipeResponse
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
-		return RecipeResponse{}, fmt.Errorf("decode recipe %d: %w", id, err)
-	}
-	return payload, nil
+	err := c.getJSON(ctx, fmt.Sprintf("/data/wow/recipe/%d", id), "static", nil, &payload)
+	return payload, err
 }
 
+// getJSON is the decode-and-close convenience wrapper for small static
+// payloads; large or streaming responses go through apiRequest directly.
 func (c *BlizzardClient) getJSON(ctx context.Context, path, namespace string, query url.Values, target any) error {
 	response, err := c.apiRequest(ctx, http.MethodGet, path, namespace, query, "")
 	if err != nil {
@@ -269,6 +294,12 @@ func (c *BlizzardClient) getJSON(ctx context.Context, path, namespace string, qu
 	return nil
 }
 
+// do executes the request factory with retries: up to four attempts with
+// exponential backoff (1s, 2s, 4s), extended whenever the server sends a
+// Retry-After. Only network errors, 5xx, and 429 are retried — other 4xx
+// responses are permanent for this payload shape, so fail fast. The request
+// is built fresh per attempt because bodies and contexts are single-use.
+// Error bodies are truncated to 4 KB to keep failure logs bounded.
 func (c *BlizzardClient) do(ctx context.Context, request func() (*http.Request, error)) (*http.Response, error) {
 	var lastErr error
 	var retryAt time.Time
@@ -312,6 +343,9 @@ func (c *BlizzardClient) do(ctx context.Context, request func() (*http.Request, 
 	return nil, lastErr
 }
 
+// retryAfter parses a Retry-After header, accepting both the delay-seconds
+// and HTTP-date forms; it returns the zero time when absent or malformed,
+// which callers treat as "no hint".
 func retryAfter(value string, now time.Time) time.Time {
 	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds >= 0 {
 		return now.Add(time.Duration(seconds) * time.Second)

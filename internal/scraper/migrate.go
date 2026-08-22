@@ -14,6 +14,11 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
+// Migrate applies all pending embedded Goose migrations before any other
+// work runs. Migrations ship inside the binary so the container image is
+// self-contained and schema state can never drift from the code version —
+// no mounted SQL directory to forget. It reuses the scraper's pool via
+// stdlib so no separate connection or config is needed.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	db := stdlib.OpenDBFromPool(pool)
 	defer db.Close()
