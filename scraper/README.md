@@ -1,14 +1,14 @@
 # Scraper
 
-Go service that seeds Blizzard reference data, then stores EU and US commodity-auction snapshots in TimescaleDB.
+Go service that seeds Blizzard reference data, then stores EU and US commodity-auction snapshots and WoW Token prices in TimescaleDB.
 
 ## Flow
 
 1. Connect to TimescaleDB/PostgreSQL 16 and apply embedded Goose migrations.
 2. Read `seeder_status`.
 3. Seed unfinished stages in dependency order: `items` → `professions` → one shared `recipes` + `reagents` traversal. Items are bulk-upserted in 10,000-row staging batches. Recipe details use a five-worker pool behind one 20 requests/second limiter; hierarchy and 500-recipe batches use PostgreSQL `COPY`.
-4. At `HH:30`, poll EU and then US using each region's stored `Last-Modified` value.
-5. Commit each changed region before requesting the next one. Unchanged regions retry every 30 seconds for at most 20 minutes. HTTP 429/5xx failures use exponential retry and honor `Retry-After`.
+4. Once the database is seeded and every regional endpoint answers a ping (commodities and token index), poll EU and then US forever: each pass re-requests both regions with their stored `Last-Modified` value, repeating every `POLL_WINDOW` (30s default) for as long as the service runs. Each region's WoW Token price (`/data/wow/token/index`) rides along on the same tick.
+5. Commit each changed region before requesting the next one; changed token prices commit with the regional `scraper_state.token_last_updated` update in one transaction. Unchanged regions log at Info and keep polling; warnings escalate per region after 10 minutes, 30 minutes, and one hour without a change (then hourly). HTTP 429/5xx failures use exponential retry and honor `Retry-After`.
 6. Stream auctions into bounded 10,000-row `COPY` batches. Keep all batches and the regional `scraper_state` update in one transaction.
 7. Store snapshots in one-day TimescaleDB chunks. Move chunks older than one day to columnstore on a daily schedule, segmented by region and item.
 
@@ -21,7 +21,7 @@ docker compose up --build -d
 docker compose logs -f scraper db
 ```
 
-Use `SCRAPE_ON_START=true docker compose up --build -d` to take an immediate snapshot instead of waiting for the next half-hour boundary.
+The scraper polls continuously by default; no scheduling flags are needed. To bound it, set `POLL_START` (delay before polling begins), `POLL_END` (duration of polling), or `SCRAPE_FROM`/`SCRAPE_UNTIL` (absolute RFC3339 period) in [`scraper/.env.example`](.env.example).
 
 The initial seed is large. It is idempotent; completed stages do not run again. `RECIPE_WORKERS` defaults to 5 and accepts 1–8 for benchmarking. `API_REQUESTS_PER_SECOND` cannot exceed 20.
 
