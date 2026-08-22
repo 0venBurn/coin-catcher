@@ -1,39 +1,30 @@
 # AGENTS.md
 
-## Response Style (Default)
+Coin Catcher — monorepo for a WoW commodities market data warehouse. Go service scrapes Blizzard auction house + WoW Token data, stores it in TimescaleDB.
 
-Use a caveman style by default in every response.
+## Layout
 
-Rules:
+- `cmd/scraper/` — entrypoint. Wires logger, pgx pool, and the scraper loop.
+- `scraper/` — core package: seeding, polling, API client, schema, config.
+  - `blizzard_api_client.go` — Blizzard API HTTP client (rate limiting, retries, `Last-Modified` conditional requests).
+  - `seeder.go` — idempotent reference-data seeding: `items` → `professions` → `recipes`/`reagents`.
+  - `scraper.go` — continuous EU/US commodity + token polling, transactional batch commits.
+  - `schema.go` — table definitions / row types.
+  - `config.go` — env-based configuration (see `.env.example`).
+  - `migrations/` — embedded Goose SQL migrations.
+  - `Makefile` — build/test helpers.
+- `internal/` — internal packages (currently just `.env` handling for local dev).
+- `docs/` — durable docs. `data-invariants.md` describes storage guarantees.
+- `compose.yaml` + `Dockerfile` — local stack: TimescaleDB (pg16) on :5432 + scraper service.
 
-- Terse, high-signal, no filler.
-- Brief and neutral.
-- Keep full technical accuracy.
-- Fragments OK.
-- Keep exact technical terms, code, and error strings unchanged.
+## Run
 
-Disable caveman only when:
+```bash
+cp scraper/.env.example scraper/.env   # fill CLIENT_ID / CLIENT_SECRET
+docker compose up --build -d
+```
 
-- Generating formal artifacts (reports, docs, PRDs, ADRs).
-- Safety/irreversible warnings need full clarity.
-- User explicitly says: "normal mode" or "stop caveman".
-- Editing code files & writing comments
+## Notes
 
-After exception section completes, resume caveman style automatically.
-
-Examples:
-
-- User: "Why React component re-render?"
-  - Good: "Inline obj prop -> new ref -> re-render. `useMemo`."
-- User: "Explain DB pooling"
-  - Good: "Pool = reuse DB conn. Skip handshake -> faster under load."
-- Destructive op warning (temporary clarity mode):
-  - "**Warning:** This will permanently delete all rows in `users` and cannot be undone. Confirm backup first."
-
-## Docs
-
-Read docs when they help current intent. Docs are organised as follows.
-
-## Project Context
-
-This project is a mono repo with directories for each part of the project.
+- Go 1.23. Deps: `pgx/v5`, `goose/v3`.
+- Seeding is idempotent per stage (`seeder_status`). Polling runs forever by default; bound with `POLL_START`/`POLL_END`/`SCRAPE_FROM`/`SCRAPE_UNTIL`.
