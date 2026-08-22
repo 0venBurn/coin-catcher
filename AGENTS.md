@@ -9,12 +9,11 @@ Coin Catcher — monorepo for a WoW commodities market data warehouse. Go servic
   - `blizzard_api_client.go` — Blizzard API HTTP client (rate limiting, retries, `Last-Modified` conditional requests).
   - `seeder.go` — idempotent reference-data seeding: `items` → `professions` → `recipes`/`reagents`.
   - `scraper.go` — continuous EU/US commodity + token polling, transactional batch commits.
-  - `schema.go` — table definitions / row types.
+  - `migrate.go` — embedded Goose migration runner.
   - `config.go` — env-based configuration (see `.env.example`).
   - `migrations/` — embedded Goose SQL migrations.
   - `Makefile` — build/test helpers.
-- `internal/` — internal packages (currently just `.env` handling for local dev).
-- `internal/api/`, `internal/backtest/` — empty placeholders for future services.
+- `internal/` — internal packages; `internal/scraper/` is currently the only one.
 - `docs/` — durable docs. `data-invariants.md` describes storage guarantees.
 - `compose.yaml` + `Dockerfile` — local stack: TimescaleDB (pg16) on :5432 + scraper service.
 
