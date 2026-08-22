@@ -19,7 +19,7 @@ services:
   scraper:
     build: .
     env_file:
-      - scraper/.env
+      - internal/scraper/.env
     environment:
       DATABASE_URL: postgres://coin_catcher:coin_catcher@db:5432/coin_catcher?sslmode=disable
     depends_on:

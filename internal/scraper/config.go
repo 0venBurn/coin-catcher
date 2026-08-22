@@ -34,7 +34,7 @@ func LoadConfig() (Config, error) {
 	if envFile == "" {
 		envFile = ".env"
 		if _, err := os.Stat(envFile); errors.Is(err, os.ErrNotExist) {
-			envFile = "scraper/.env"
+			envFile = "internal/scraper/.env"
 		}
 	}
 	if err := loadDotEnv(envFile); err != nil && !errors.Is(err, os.ErrNotExist) {

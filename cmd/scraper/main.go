@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/0venburn/coin-catcher/scraper"
+	"github.com/0venburn/coin-catcher/internal/scraper"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

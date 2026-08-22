@@ -1,7 +1,7 @@
 .PHONY: format test run up down logs db
 
 format:
-	cd .. && gofmt -w cmd scraper
+	cd .. && gofmt -w cmd internal
 
 test:
 	cd .. && go test ./...

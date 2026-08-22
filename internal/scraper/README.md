@@ -15,13 +15,13 @@ Go service that seeds Blizzard reference data, then stores EU and US commodity-a
 ## Run locally
 
 ```bash
-cp scraper/.env.example scraper/.env
+cp internal/scraper/.env.example internal/scraper/.env
 # Fill CLIENT_ID and CLIENT_SECRET.
 docker compose up --build -d
 docker compose logs -f scraper db
 ```
 
-The scraper polls continuously by default; no scheduling flags are needed. To bound it, set `POLL_START` (delay before polling begins), `POLL_END` (duration of polling), or `SCRAPE_FROM`/`SCRAPE_UNTIL` (absolute RFC3339 period) in [`scraper/.env.example`](.env.example).
+The scraper polls continuously by default; no scheduling flags are needed. To bound it, set `POLL_START` (delay before polling begins), `POLL_END` (duration of polling), or `SCRAPE_FROM`/`SCRAPE_UNTIL` (absolute RFC3339 period) in [`internal/scraper/.env.example`](.env.example).
 
 The initial seed is large. It is idempotent; completed stages do not run again. `RECIPE_WORKERS` defaults to 5 and accepts 1–8 for benchmarking. `API_REQUESTS_PER_SECOND` cannot exceed 20.
 
@@ -49,4 +49,4 @@ docker compose up -d db
 go run ./cmd/scraper
 ```
 
-Configuration defaults are in [`scraper/.env.example`](.env.example). Schema changes belong in a new ordered SQL file under [`migrations/`](migrations/); applied versions are tracked in `goose_db_version`.
+Configuration defaults are in [`internal/scraper/.env.example`](.env.example). Schema changes belong in a new ordered SQL file under [`migrations/`](migrations/); applied versions are tracked in `goose_db_version`.
