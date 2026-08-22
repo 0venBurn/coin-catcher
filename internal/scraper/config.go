@@ -15,18 +15,21 @@ type Config struct {
 	ClientSecret string
 	DatabaseURL  string
 	Regions      []string
-	// Polling configuration. Defaults give a continuous 24h scraper: polling
-	// starts immediately after startup readiness checks and never stops.
-	PollStartOffset time.Duration // POLL_START, delay before polling begins.
-	PollEnd         time.Duration // POLL_END, duration of polling since it began; zero polls indefinitely.
-	PollInterval    time.Duration // POLL_WINDOW, retry interval between poll passes.
-	// Scraper period configuration. Optional date bounds for users who only
-	// want the service active during a specific period.
-	ScrapeFrom           time.Time // SCRAPE_FROM, RFC3339; zero means unbounded.
-	ScrapeUntil          time.Time // SCRAPE_UNTIL, RFC3339; zero means unbounded.
+	// Schedule is the resolved polling window: POLL_START (relative delay)
+	// and SCRAPE_FROM (absolute) merge into StartAt; POLL_END (relative
+	// duration) and SCRAPE_UNTIL (absolute) merge into StopAt. A zero StopAt
+	// polls indefinitely.
+	Schedule             Schedule
+	PollWindow           time.Duration // POLL_WINDOW, sleep between poll passes.
 	RequestTimeout       time.Duration
 	APIRequestsPerSecond int
 	RecipeWorkers        int
+}
+
+// Schedule is the concrete [StartAt, StopAt] window the scraper runs in.
+type Schedule struct {
+	StartAt time.Time
+	StopAt  time.Time // zero means unbounded
 }
 
 func LoadConfig() (Config, error) {
@@ -46,9 +49,7 @@ func LoadConfig() (Config, error) {
 		ClientSecret:         os.Getenv("CLIENT_SECRET"),
 		DatabaseURL:          valueOrDefault("DATABASE_URL", "postgres://coin_catcher:coin_catcher@localhost:5432/coin_catcher?sslmode=disable"),
 		Regions:              []string{"eu", "us"},
-		PollStartOffset:      0,
-		PollEnd:              0,
-		PollInterval:         30 * time.Second,
+		PollWindow:           30 * time.Second,
 		RequestTimeout:       2 * time.Minute,
 		APIRequestsPerSecond: 20,
 		RecipeWorkers:        5,
@@ -57,24 +58,29 @@ func LoadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("CLIENT_ID and CLIENT_SECRET are required")
 	}
 	var err error
-	if config.PollStartOffset, err = optionalDurationValue("POLL_START", config.PollStartOffset); err != nil {
+	pollStart, err := optionalDurationValue("POLL_START", 0)
+	if err != nil {
 		return Config{}, err
 	}
-	if config.PollEnd, err = optionalDurationValue("POLL_END", config.PollEnd); err != nil {
+	pollEnd, err := optionalDurationValue("POLL_END", 0)
+	if err != nil {
 		return Config{}, err
 	}
-	if config.PollInterval, err = durationValue("POLL_WINDOW", config.PollInterval); err != nil {
+	if config.PollWindow, err = durationValue("POLL_WINDOW", config.PollWindow); err != nil {
 		return Config{}, err
 	}
-	if config.ScrapeFrom, err = timeValue("SCRAPE_FROM"); err != nil {
+	scrapeFrom, err := timeValue("SCRAPE_FROM")
+	if err != nil {
 		return Config{}, err
 	}
-	if config.ScrapeUntil, err = timeValue("SCRAPE_UNTIL"); err != nil {
+	scrapeUntil, err := timeValue("SCRAPE_UNTIL")
+	if err != nil {
 		return Config{}, err
 	}
-	if !config.ScrapeFrom.IsZero() && !config.ScrapeUntil.IsZero() && config.ScrapeUntil.Before(config.ScrapeFrom) {
+	if !scrapeFrom.IsZero() && !scrapeUntil.IsZero() && scrapeUntil.Before(scrapeFrom) {
 		return Config{}, fmt.Errorf("SCRAPE_UNTIL must not be before SCRAPE_FROM")
 	}
+	config.Schedule = resolveSchedule(time.Now(), pollStart, pollEnd, scrapeFrom, scrapeUntil)
 	if config.APIRequestsPerSecond, err = intValue("API_REQUESTS_PER_SECOND", config.APIRequestsPerSecond, 1, 20); err != nil {
 		return Config{}, err
 	}
@@ -82,6 +88,24 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 	return config, nil
+}
+
+// resolveSchedule merges the relative bounds (POLL_START delay, POLL_END
+// duration since start) with the absolute ones (SCRAPE_FROM, SCRAPE_UNTIL)
+// into one concrete window. StopAt is zero when polling is unbounded.
+func resolveSchedule(now time.Time, pollStart, pollEnd time.Duration, scrapeFrom, scrapeUntil time.Time) Schedule {
+	startAt := now.Add(pollStart)
+	if scrapeFrom.After(startAt) {
+		startAt = scrapeFrom
+	}
+	var stopAt time.Time
+	if pollEnd > 0 {
+		stopAt = startAt.Add(pollEnd)
+	}
+	if !scrapeUntil.IsZero() && (stopAt.IsZero() || scrapeUntil.Before(stopAt)) {
+		stopAt = scrapeUntil
+	}
+	return Schedule{StartAt: startAt, StopAt: stopAt}
 }
 
 func valueOrDefault(name, fallback string) string {

@@ -1,9 +1,11 @@
 package scraper
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,26 +14,33 @@ import (
 	"time"
 )
 
-func TestStaleWarnCount(t *testing.T) {
-	tests := []struct {
-		name  string
-		stale time.Duration
-		want  int
-	}{
-		{"fresh", 0, 0},
-		{"under first threshold", 9 * time.Minute, 0},
-		{"first threshold", 10 * time.Minute, 1},
-		{"second threshold", 30 * time.Minute, 2},
-		{"third threshold", time.Hour, 3},
-		{"one hour past third threshold", 2 * time.Hour, 4},
-		{"three hours past third threshold", 4 * time.Hour, 6},
+func TestWarnIfStale(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	s := &Scraper{log: logger}
+
+	base := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	rg := &regionState{lastChange: base}
+
+	// Fresh region: no warning.
+	s.warnIfStale("eu", rg, base.Add(5*time.Minute))
+	if buf.Len() != 0 {
+		t.Fatalf("fresh region warned: %s", buf.String())
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := staleWarnCount(test.stale); got != test.want {
-				t.Fatalf("staleWarnCount(%s) = %d, want %d", test.stale, got, test.want)
-			}
-		})
+	// Stale past threshold: first warning.
+	s.warnIfStale("eu", rg, base.Add(10*time.Minute))
+	if !strings.Contains(buf.String(), "commodity data stale") {
+		t.Fatalf("expected stale warning, got: %s", buf.String())
+	}
+	// Within backoff: suppressed.
+	s.warnIfStale("eu", rg, base.Add(40*time.Minute))
+	if n := strings.Count(buf.String(), "commodity data stale"); n != 1 {
+		t.Fatalf("backoff violated: %d warnings", n)
+	}
+	// After backoff: re-warned.
+	s.warnIfStale("eu", rg, base.Add(time.Hour+10*time.Minute))
+	if n := strings.Count(buf.String(), "commodity data stale"); n != 2 {
+		t.Fatalf("expected re-warning after backoff, got %d", n)
 	}
 }
 

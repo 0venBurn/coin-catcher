@@ -11,46 +11,27 @@ import (
 )
 
 type Scraper struct {
-	pool            *pgxpool.Pool
-	clients         []*BlizzardClient
-	log             *slog.Logger
-	pollStartOffset time.Duration
-	pollEnd         time.Duration
-	pollInterval    time.Duration
-	scrapeFrom      time.Time
-	scrapeUntil     time.Time
+	pool       *pgxpool.Pool
+	clients    []*BlizzardClient
+	log        *slog.Logger
+	schedule   Schedule // resolved [StartAt, StopAt] window; zero StopAt polls forever
+	pollWindow time.Duration
 }
 
 func NewScraper(pool *pgxpool.Pool, clients []*BlizzardClient, logger *slog.Logger, config Config) *Scraper {
 	return &Scraper{
 		pool: pool, clients: clients, log: logger,
-		pollStartOffset: config.PollStartOffset, pollEnd: config.PollEnd,
-		pollInterval: config.PollInterval,
-		scrapeFrom:   config.ScrapeFrom, scrapeUntil: config.ScrapeUntil,
+		schedule: config.Schedule, pollWindow: config.PollWindow,
 	}
 }
 
-// Run polls each region every interval forever (a continuous 24h scraper by
-// default), writing snapshots whenever the upstream data changes. POLL_START
-// delays the first poll, POLL_END bounds its duration, and SCRAPE_FROM and
-// SCRAPE_UNTIL bound it to an absolute date period.
+// Run waits for the configured window to open, then polls each region every
+// POLL_WINDOW until the window closes or the context is cancelled, writing
+// snapshots whenever the upstream data changes.
 func (s *Scraper) Run(ctx context.Context) error {
-	now := time.Now()
-	start := now.Add(s.pollStartOffset)
-	if s.scrapeFrom.After(start) {
-		start = s.scrapeFrom
-	}
-	var stopAt time.Time
-	if s.pollEnd > 0 {
-		stopAt = start.Add(s.pollEnd)
-	}
-	if !s.scrapeUntil.IsZero() && (stopAt.IsZero() || s.scrapeUntil.Before(stopAt)) {
-		stopAt = s.scrapeUntil
-	}
-
-	if start.After(now) {
-		s.log.Info("waiting for scraping to begin", "starts_at", start, "stops_at", optionalTime(stopAt))
-		timer := time.NewTimer(time.Until(start))
+	if s.schedule.StartAt.After(time.Now()) {
+		s.log.Info("waiting for scraping to begin", "starts_at", s.schedule.StartAt, "stops_at", logTime(s.schedule.StopAt))
+		timer := time.NewTimer(time.Until(s.schedule.StartAt))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -58,8 +39,8 @@ func (s *Scraper) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
-	if !stopAt.IsZero() && !stopAt.After(time.Now()) {
-		s.log.Info("scrape period already ended", "ended_at", stopAt)
+	if !s.schedule.StopAt.IsZero() && !s.schedule.StopAt.After(time.Now()) {
+		s.log.Info("scrape period already ended", "ended_at", s.schedule.StopAt)
 		return nil
 	}
 
@@ -81,11 +62,11 @@ func (s *Scraper) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		if !stopAt.IsZero() && !time.Now().Add(s.pollInterval).Before(stopAt) {
-			s.log.Info("scrape period ended", "ended_at", stopAt)
+		if !s.schedule.StopAt.IsZero() && !time.Now().Add(s.pollWindow).Before(s.schedule.StopAt) {
+			s.log.Info("scrape period ended", "ended_at", s.schedule.StopAt)
 			return nil
 		}
-		timer := time.NewTimer(s.pollInterval)
+		timer := time.NewTimer(s.pollWindow)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -101,14 +82,25 @@ type regionState struct {
 	lastModified string    // commodities Last-Modified sent as If-Modified-Since
 	tokenUpdated time.Time // token endpoint's last_updated_timestamp, for dedup
 	lastChange   time.Time // last detected commodity change
-	warnedStale  int       // stale warnings already logged
+	lastWarnAt   time.Time // last "commodity data stale" warning, for backoff
 }
 
+// scraper_state SQL. The table's shape is shared by these three statements
+// (and only these) — change them together.
+const (
+	sqlLoadRegionState   = `SELECT last_modified, token_last_updated FROM scraper_state WHERE region=$1`
+	sqlUpsertRegionState = `INSERT INTO scraper_state (region, last_modified, last_snapshot_time, updated_at)
+		VALUES ($1,$2,$3,NOW()) ON CONFLICT (region) DO UPDATE SET
+		last_modified=EXCLUDED.last_modified, last_snapshot_time=EXCLUDED.last_snapshot_time, updated_at=NOW()`
+	sqlUpdateTokenState = `UPDATE scraper_state SET token_last_updated=$2, updated_at=NOW() WHERE region=$1`
+)
+
+// loadRegionState reads one region's dedup state; both columns are nullable,
+// hence the pointer scan before copying into the plain struct fields.
 func (s *Scraper) loadRegionState(ctx context.Context, region string) (*regionState, error) {
 	var lastModified *string
 	var tokenUpdated *time.Time
-	err := s.pool.QueryRow(ctx,
-		`SELECT last_modified, token_last_updated FROM scraper_state WHERE region=$1`, region).
+	err := s.pool.QueryRow(ctx, sqlLoadRegionState, region).
 		Scan(&lastModified, &tokenUpdated)
 	if err == pgx.ErrNoRows {
 		return &regionState{}, nil
@@ -132,17 +124,18 @@ func (s *Scraper) loadRegionState(ctx context.Context, region string) (*regionSt
 func (s *Scraper) pollPass(ctx context.Context, state map[string]*regionState) {
 	for _, client := range s.clients {
 		rg := state[client.region]
-		modified, changed, auctionCount, err := s.storeStreamedSnapshot(ctx, client, rg.lastModified)
-		if err != nil {
+		stored, err := s.storeStreamedSnapshot(ctx, client, rg.lastModified)
+		switch {
+		case err != nil:
 			s.log.Warn("commodity poll failed", "region", client.region, "error", err)
-		} else if !changed {
+		case stored == nil:
 			s.log.Info("commodity data unchanged", "region", client.region, "last_modified", rg.lastModified)
 			s.warnIfStale(client.region, rg, time.Now())
-		} else {
-			rg.lastModified = modified
+		default:
+			rg.lastModified = stored.modified
 			rg.lastChange = time.Now()
-			rg.warnedStale = 0
-			s.log.Info("commodity snapshot stored", "region", client.region, "auctions", auctionCount, "last_modified", modified)
+			rg.lastWarnAt = time.Time{}
+			s.log.Info("commodity snapshot stored", "region", client.region, "auctions", stored.auctions, "last_modified", stored.modified)
 		}
 		s.pollToken(ctx, client, rg)
 	}
@@ -163,24 +156,7 @@ func (s *Scraper) pollToken(ctx context.Context, client *BlizzardClient, rg *reg
 		return
 	}
 	snapshotTime := time.Now().UTC()
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		s.log.Warn("token store failed", "region", client.region, "error", err)
-		return
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO wow_tokens (region, price, blizzard_updated_at, snapshot_time) VALUES ($1,$2,$3,$4)`,
-		client.region, payload.Price, updated, snapshotTime); err != nil {
-		s.log.Warn("token store failed", "region", client.region, "error", err)
-		return
-	}
-	if _, err := tx.Exec(ctx, `UPDATE scraper_state SET token_last_updated=$2, updated_at=NOW() WHERE region=$1`,
-		client.region, updated); err != nil {
-		s.log.Warn("token store failed", "region", client.region, "error", err)
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.storeToken(ctx, client.region, payload, updated, snapshotTime); err != nil {
 		s.log.Warn("token store failed", "region", client.region, "error", err)
 		return
 	}
@@ -188,36 +164,45 @@ func (s *Scraper) pollToken(ctx context.Context, client *BlizzardClient, rg *reg
 	s.log.Info("token price stored", "region", client.region, "price", payload.Price, "blizzard_updated_at", updated, "snapshot_time", snapshotTime)
 }
 
-// staleWarnThresholds are the no-change durations after which a region logs a
-// warning; afterwards one more warning is logged per full additional hour so
-// Grafana can alert on persistently stale regions.
-var staleWarnThresholds = []time.Duration{10 * time.Minute, 30 * time.Minute, time.Hour}
-
-func staleWarnCount(stale time.Duration) int {
-	count := 0
-	for _, threshold := range staleWarnThresholds {
-		if stale >= threshold {
-			count++
-		}
+// storeToken atomically records a token price row and advances the region's
+// dedup timestamp.
+func (s *Scraper) storeToken(ctx context.Context, region string, payload TokenIndexResponse, updated, snapshotTime time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
 	}
-	last := staleWarnThresholds[len(staleWarnThresholds)-1]
-	if stale >= last {
-		count += int((stale - last) / time.Hour)
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO wow_tokens (region, price, blizzard_updated_at, snapshot_time) VALUES ($1,$2,$3,$4)`,
+		region, payload.Price, updated, snapshotTime); err != nil {
+		return err
 	}
-	return count
+	if _, err := tx.Exec(ctx, sqlUpdateTokenState, region, updated); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
+
+// A region is warned as stale after 10 minutes without an upstream change,
+// then re-warned once per hour so Grafana can alert on persistently stale
+// regions.
+const (
+	staleWarnAfter   = 10 * time.Minute
+	staleWarnBackoff = time.Hour
+)
 
 func (s *Scraper) warnIfStale(region string, rg *regionState, now time.Time) {
 	stale := now.Sub(rg.lastChange)
-	count := staleWarnCount(stale)
-	if count <= rg.warnedStale {
+	if stale < staleWarnAfter || now.Sub(rg.lastWarnAt) < staleWarnBackoff {
 		return
 	}
-	rg.warnedStale = count
-	s.log.Warn("commodity data stale", "region", region, "stale_for", stale.Round(time.Second), "warning", count)
+	rg.lastWarnAt = now
+	s.log.Warn("commodity data stale", "region", region, "stale_for", stale.Round(time.Second))
 }
 
-func optionalTime(t time.Time) any {
+// logTime formats a possibly-zero time for logging: zero renders as
+// "never" (string) instead of a timestamp. Deliberate any-return for slog.
+func logTime(t time.Time) any {
 	if t.IsZero() {
 		return "never"
 	}
@@ -226,27 +211,46 @@ func optionalTime(t time.Time) any {
 
 const snapshotCopyBatchSize = 10_000
 
-func (s *Scraper) storeStreamedSnapshot(ctx context.Context, client *BlizzardClient, lastModified string) (string, bool, int, error) {
+// storedSnapshot reports a committed commodity snapshot; the zero-value
+// pointer (nil) means upstream data was unchanged.
+type storedSnapshot struct {
+	modified string
+	auctions int
+}
+
+// storeStreamedSnapshot fetches commodities with If-Modified-Since and copies
+// any new auctions into auction_snapshots together with the scraper_state
+// last_modified update, all in one transaction. Returns nil when nothing
+// changed.
+func (s *Scraper) storeStreamedSnapshot(ctx context.Context, client *BlizzardClient, lastModified string) (*storedSnapshot, error) {
 	region := client.region
+	snapshotTime := time.Now().UTC()
+
 	var tx pgx.Tx
 	defer func() {
 		if tx != nil {
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	ensureTx := func() error {
+		if tx != nil {
+			return nil
+		}
+		begun, err := s.pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		tx = begun
+		return nil
+	}
 
-	snapshotTime := time.Now().UTC()
 	batch := make([]CommodityAuction, 0, snapshotCopyBatchSize)
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		if tx == nil {
-			var err error
-			tx, err = s.pool.Begin(ctx)
-			if err != nil {
-				return err
-			}
+		if err := ensureTx(); err != nil {
+			return err
 		}
 		_, err := tx.CopyFrom(ctx, pgx.Identifier{"auction_snapshots"},
 			[]string{"auction_id", "item_id", "region", "unit_price", "quantity", "time_left", "snapshot_time"},
@@ -269,32 +273,29 @@ func (s *Scraper) storeStreamedSnapshot(ctx context.Context, client *BlizzardCli
 		return nil
 	})
 	if err != nil {
-		return "", false, 0, err
+		return nil, err
 	}
-	if !changed || modified == lastModified && lastModified != "" {
-		return modified, false, 0, nil
+	// A 304 already comes back as !changed; the second clause also skips a 200
+	// whose Last-Modified matches what we sent, which carries no new data.
+	if !changed || (lastModified != "" && modified == lastModified) {
+		return nil, nil
 	}
 	if modified == "" {
-		return "", false, 0, fmt.Errorf("%s commodities response omitted Last-Modified", region)
+		return nil, fmt.Errorf("%s commodities response omitted Last-Modified", region)
 	}
 	if err := flush(); err != nil {
-		return "", false, 0, err
+		return nil, err
 	}
-	if tx == nil {
-		tx, err = s.pool.Begin(ctx)
-		if err != nil {
-			return "", false, 0, err
-		}
+	if err := ensureTx(); err != nil {
+		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO scraper_state (region, last_modified, last_snapshot_time, updated_at)
-		VALUES ($1,$2,$3,NOW()) ON CONFLICT (region) DO UPDATE SET
-		last_modified=EXCLUDED.last_modified, last_snapshot_time=EXCLUDED.last_snapshot_time, updated_at=NOW()`,
+	if _, err := tx.Exec(ctx, sqlUpsertRegionState,
 		region, modified, snapshotTime); err != nil {
-		return "", false, 0, fmt.Errorf("update scraper state: %w", err)
+		return nil, fmt.Errorf("update scraper state: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return "", false, 0, fmt.Errorf("commit auction snapshot: %w", err)
+		return nil, fmt.Errorf("commit auction snapshot: %w", err)
 	}
 	tx = nil
-	return modified, true, count, nil
+	return &storedSnapshot{modified: modified, auctions: count}, nil
 }
