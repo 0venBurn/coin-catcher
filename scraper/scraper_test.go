@@ -12,28 +12,24 @@ import (
 	"time"
 )
 
-func TestNextHalfHour(t *testing.T) {
+func TestStaleWarnCount(t *testing.T) {
 	tests := []struct {
-		name string
-		now  string
-		want string
+		name  string
+		stale time.Duration
+		want  int
 	}{
-		{"before half hour", "2026-08-03T10:12:00Z", "2026-08-03T10:30:00Z"},
-		{"on half hour", "2026-08-03T10:30:00Z", "2026-08-03T10:30:00Z"},
-		{"after half hour", "2026-08-03T10:52:00Z", "2026-08-03T11:30:00Z"},
+		{"fresh", 0, 0},
+		{"under first threshold", 9 * time.Minute, 0},
+		{"first threshold", 10 * time.Minute, 1},
+		{"second threshold", 30 * time.Minute, 2},
+		{"third threshold", time.Hour, 3},
+		{"one hour past third threshold", 2 * time.Hour, 4},
+		{"three hours past third threshold", 4 * time.Hour, 6},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			now, err := time.Parse(time.RFC3339, test.now)
-			if err != nil {
-				t.Fatal(err)
-			}
-			want, err := time.Parse(time.RFC3339, test.want)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := nextHalfHour(now); !got.Equal(want) {
-				t.Fatalf("nextHalfHour(%s) = %s, want %s", now, got, want)
+			if got := staleWarnCount(test.stale); got != test.want {
+				t.Fatalf("staleWarnCount(%s) = %d, want %d", test.stale, got, test.want)
 			}
 		})
 	}
@@ -79,6 +75,31 @@ func TestRetryAfter(t *testing.T) {
 	}
 	if got := retryAfter("invalid", now); !got.IsZero() {
 		t.Fatalf("invalid Retry-After = %s, want zero", got)
+	}
+}
+
+func TestGetTokenIndexDecodesPrice(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"_links":{},"last_updated_timestamp":1699285102000,"price":2587950000}`)),
+		}, nil
+	})}
+	client := NewBlizzardClient(httpClient, "id", "secret", "eu", NewAPIRateLimiter(100_000))
+	client.token = "token"
+	client.tokenExpires = time.Now().Add(time.Hour)
+
+	payload, err := client.GetTokenIndex(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.Price != 2587950000 || payload.LastUpdatedTimestamp != 1699285102000 {
+		t.Fatalf("unexpected token index: %+v", payload)
+	}
+	if updated := time.UnixMilli(payload.LastUpdatedTimestamp).UTC(); updated.Year() != 2023 {
+		t.Fatalf("last_updated_timestamp did not decode as epoch millis: %s", updated)
 	}
 }
 

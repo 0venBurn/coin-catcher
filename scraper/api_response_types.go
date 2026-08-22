@@ -21,6 +21,13 @@ type CommodityAuctionsAPIResponse struct {
 	Auctions []CommodityAuction `json:"auctions"`
 }
 
+type TokenIndexResponse struct {
+	// Epoch milliseconds of Blizzard's own last token price update; used for
+	// dedup because the endpoint has no conditional-request support.
+	LastUpdatedTimestamp int64 `json:"last_updated_timestamp"`
+	Price                int64 `json:"price"` // copper (gold × 10,000)
+}
+
 type APIReference struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`

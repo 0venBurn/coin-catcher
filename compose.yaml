@@ -1,6 +1,7 @@
 services:
   db:
     image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
     environment:
       POSTGRES_DB: coin_catcher
       POSTGRES_USER: coin_catcher
@@ -21,7 +22,6 @@ services:
       - scraper/.env
     environment:
       DATABASE_URL: postgres://coin_catcher:coin_catcher@db:5432/coin_catcher?sslmode=disable
-      SCRAPE_ON_START: ${SCRAPE_ON_START:-false}
     depends_on:
       db:
         condition: service_healthy

@@ -11,16 +11,22 @@ import (
 )
 
 type Config struct {
-	ClientID             string
-	ClientSecret         string
-	DatabaseURL          string
-	Regions              []string
-	PollInterval         time.Duration
-	PollWindow           time.Duration
+	ClientID     string
+	ClientSecret string
+	DatabaseURL  string
+	Regions      []string
+	// Polling configuration. Defaults give a continuous 24h scraper: polling
+	// starts immediately after startup readiness checks and never stops.
+	PollStartOffset time.Duration // POLL_START, delay before polling begins.
+	PollEnd         time.Duration // POLL_END, duration of polling since it began; zero polls indefinitely.
+	PollInterval    time.Duration // POLL_WINDOW, retry interval between poll passes.
+	// Scraper period configuration. Optional date bounds for users who only
+	// want the service active during a specific period.
+	ScrapeFrom           time.Time // SCRAPE_FROM, RFC3339; zero means unbounded.
+	ScrapeUntil          time.Time // SCRAPE_UNTIL, RFC3339; zero means unbounded.
 	RequestTimeout       time.Duration
 	APIRequestsPerSecond int
 	RecipeWorkers        int
-	RunOnStart           bool
 }
 
 func LoadConfig() (Config, error) {
@@ -40,22 +46,34 @@ func LoadConfig() (Config, error) {
 		ClientSecret:         os.Getenv("CLIENT_SECRET"),
 		DatabaseURL:          valueOrDefault("DATABASE_URL", "postgres://coin_catcher:coin_catcher@localhost:5432/coin_catcher?sslmode=disable"),
 		Regions:              []string{"eu", "us"},
+		PollStartOffset:      0,
+		PollEnd:              0,
 		PollInterval:         30 * time.Second,
-		PollWindow:           20 * time.Minute,
 		RequestTimeout:       2 * time.Minute,
 		APIRequestsPerSecond: 20,
 		RecipeWorkers:        5,
-		RunOnStart:           boolValue("SCRAPE_ON_START"),
 	}
 	if config.ClientID == "" || config.ClientSecret == "" {
 		return Config{}, fmt.Errorf("CLIENT_ID and CLIENT_SECRET are required")
 	}
 	var err error
-	if config.PollInterval, err = durationValue("POLL_INTERVAL", config.PollInterval); err != nil {
+	if config.PollStartOffset, err = optionalDurationValue("POLL_START", config.PollStartOffset); err != nil {
 		return Config{}, err
 	}
-	if config.PollWindow, err = durationValue("POLL_WINDOW", config.PollWindow); err != nil {
+	if config.PollEnd, err = optionalDurationValue("POLL_END", config.PollEnd); err != nil {
 		return Config{}, err
+	}
+	if config.PollInterval, err = durationValue("POLL_WINDOW", config.PollInterval); err != nil {
+		return Config{}, err
+	}
+	if config.ScrapeFrom, err = timeValue("SCRAPE_FROM"); err != nil {
+		return Config{}, err
+	}
+	if config.ScrapeUntil, err = timeValue("SCRAPE_UNTIL"); err != nil {
+		return Config{}, err
+	}
+	if !config.ScrapeFrom.IsZero() && !config.ScrapeUntil.IsZero() && config.ScrapeUntil.Before(config.ScrapeFrom) {
+		return Config{}, fmt.Errorf("SCRAPE_UNTIL must not be before SCRAPE_FROM")
 	}
 	if config.APIRequestsPerSecond, err = intValue("API_REQUESTS_PER_SECOND", config.APIRequestsPerSecond, 1, 20); err != nil {
 		return Config{}, err
@@ -85,6 +103,32 @@ func durationValue(name string, fallback time.Duration) (time.Duration, error) {
 	return duration, nil
 }
 
+// optionalDurationValue parses a Go duration where zero is a valid value
+// ("0", empty, or unset all mean "no constraint").
+func optionalDurationValue(name string, fallback time.Duration) (time.Duration, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative Go duration", name)
+	}
+	return duration, nil
+}
+
+func timeValue(name string) (time.Time, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return time.Time{}, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%s must be an RFC3339 timestamp", name)
+	}
+	return parsed, nil
+}
+
 func intValue(name string, fallback, minimum, maximum int) (int, error) {
 	value := os.Getenv(name)
 	if value == "" {
@@ -95,11 +139,6 @@ func intValue(name string, fallback, minimum, maximum int) (int, error) {
 		return 0, fmt.Errorf("%s must be an integer between %d and %d", name, minimum, maximum)
 	}
 	return parsed, nil
-}
-
-func boolValue(name string) bool {
-	value, _ := strconv.ParseBool(os.Getenv(name))
-	return value
 }
 
 func loadDotEnv(path string) error {

@@ -77,6 +77,15 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("seed database: %w", err)
 	}
 
+	// Polling starts only after every regional endpoint answers, so outbound
+	// connectivity and credentials are proven before the first snapshot.
+	for _, client := range clients {
+		if err := client.Ping(ctx); err != nil {
+			return fmt.Errorf("ping %s endpoints: %w", client.Region(), err)
+		}
+		logger.Info("blizzard api reachable", "region", client.Region())
+	}
+
 	loop := scraper.NewScraper(pool, clients, logger, config)
-	return loop.Run(ctx, config.RunOnStart)
+	return loop.Run(ctx)
 }
