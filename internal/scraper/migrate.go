@@ -2,6 +2,7 @@ package scraper
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"fmt"
 	"io/fs"
@@ -23,16 +24,40 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	db := stdlib.OpenDBFromPool(pool)
 	defer db.Close()
 
-	migrationFiles, err := fs.Sub(migrations, "migrations")
+	provider, err := migrationProvider(db)
 	if err != nil {
-		return fmt.Errorf("open embedded migrations: %w", err)
-	}
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrationFiles)
-	if err != nil {
-		return fmt.Errorf("initialize migrations: %w", err)
+		return err
 	}
 	if _, err := provider.Up(ctx); err != nil {
 		return fmt.Errorf("apply migrations: %w", err)
 	}
 	return nil
+}
+
+// migrateDown rolls back one migration for integration verification. Runtime
+// startup only calls Migrate; keeping down support here makes tests exercise
+// the same embedded files and Goose provider as production.
+func migrateDown(ctx context.Context, pool *pgxpool.Pool) error {
+	db := stdlib.OpenDBFromPool(pool)
+	defer db.Close()
+	provider, err := migrationProvider(db)
+	if err != nil {
+		return err
+	}
+	if _, err := provider.Down(ctx); err != nil {
+		return fmt.Errorf("roll back migration: %w", err)
+	}
+	return nil
+}
+
+func migrationProvider(db *sql.DB) (*goose.Provider, error) {
+	migrationFiles, err := fs.Sub(migrations, "migrations")
+	if err != nil {
+		return nil, fmt.Errorf("open embedded migrations: %w", err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrationFiles)
+	if err != nil {
+		return nil, fmt.Errorf("initialize migrations: %w", err)
+	}
+	return provider, nil
 }

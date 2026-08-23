@@ -23,7 +23,8 @@ type Config struct {
 	// duration) and SCRAPE_UNTIL (absolute) merge into StopAt. A zero StopAt
 	// polls indefinitely.
 	Schedule             Schedule
-	PollWindow           time.Duration // POLL_WINDOW, sleep between poll passes.
+	PollWindow           time.Duration // POLL_WINDOW, sleep between Blizzard poll passes.
+	TSMPollWindow        time.Duration // TSM_POLL_WINDOW, independent public-data cadence.
 	RequestTimeout       time.Duration
 	APIRequestsPerSecond int
 	RecipeWorkers        int
@@ -62,6 +63,7 @@ func LoadConfig() (Config, error) {
 		DatabaseURL:          valueOrDefault("DATABASE_URL", "postgres://coin_catcher:coin_catcher@localhost:5432/coin_catcher?sslmode=disable"),
 		Regions:              []string{"eu", "us"},
 		PollWindow:           30 * time.Second,
+		TSMPollWindow:        time.Hour,
 		RequestTimeout:       2 * time.Minute,
 		APIRequestsPerSecond: 20,
 		RecipeWorkers:        5,
@@ -79,6 +81,9 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 	if config.PollWindow, err = envDuration("POLL_WINDOW", config.PollWindow, time.Second); err != nil {
+		return Config{}, err
+	}
+	if config.TSMPollWindow, err = envDuration("TSM_POLL_WINDOW", config.TSMPollWindow, time.Minute); err != nil {
 		return Config{}, err
 	}
 	scrapeFrom, err := timeValue("SCRAPE_FROM")

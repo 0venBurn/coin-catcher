@@ -61,6 +61,33 @@ These errors should be investigated as upstream contract changes rather than han
 
 Profession, skill-tier, category, recipe, reagent, and item metadata is treated as shared static data across regions. It is seeded once through a regional Blizzard client. Commodity auction data remains region-specific.
 
+## TradeSkillMaster Regional Item Snapshots
+
+The public feeds are:
+
+- `https://public-data.tradeskillmaster.com/retail/eu/region/items.csv`
+- `https://public-data.tradeskillmaster.com/retail/us/region/items.csv`
+
+Observed CSV header:
+
+```text
+itemId,name,marketValue,historical,avgSalePrice,saleRate,soldPerDay,updatedAt
+```
+
+### Invariants
+
+- Every item ID is positive and unique within one regional file. A duplicate rejects and rolls back the complete file.
+- Every row in one file has exactly one shared RFC3339 `updatedAt`. Mixed timestamps reject and roll back the complete file.
+- `name` may be blank. Blank source values are stored as SQL `NULL`; TSM ingestion intentionally has no foreign key to the lagging Blizzard `items` catalog.
+- `marketValue`, `historical`, and `avgSalePrice` are nonnegative copper amounts stored as `BIGINT`. Values through at least `99,999,999,900` copper are verified.
+- `saleRate` is finite and in `[0,1]`. `soldPerDay` is finite and nonnegative.
+- EU and US publication times are independent. No cross-region timestamp equality is assumed.
+- A source timestamp must be newer than the region's committed timestamp. Snapshot rows, ETag, Last-Modified, source timestamp, and successful-poll state advance atomically.
+- CSV response bodies are streamed through bounded PostgreSQL `COPY` batches and discarded. No CSV file or complete in-memory row buffer is durable; only snapshot rows and regional state survive restart.
+- A failed parse, COPY, cancellation, or commit leaves the prior rows and validators unchanged. The next conditional GET therefore retries the changed object.
+
+A source older than approximately 26 hours emits a bounded stale warning. This threshold accounts for a nominal daily publication cadence without assuming synchronized regional publication.
+
 ## Revalidation
 
 These are observed API invariants, not guarantees published by Blizzard. Revalidate them when:
@@ -69,3 +96,4 @@ These are observed API invariants, not guarantees published by Blizzard. Revalid
 - Duplicate hierarchy membership is reported.
 - Recipe output-shape validation fails.
 - Support for another game version or API namespace is introduced.
+- The TSM CSV header, numeric domains, uniqueness, or one-timestamp-per-file assumptions change.

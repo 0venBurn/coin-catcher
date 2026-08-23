@@ -17,6 +17,7 @@ import (
 
 	"github.com/0venburn/coin-catcher/internal/scraper"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -101,6 +102,18 @@ func run(logger *slog.Logger) error {
 		logger.Info("blizzard api reachable", "region", client.Region())
 	}
 
-	loop := scraper.NewScraper(pool, clients, logger, config)
-	return loop.Run(ctx)
+	// TSM public CSV polling is deliberately separate from Blizzard OAuth,
+	// rate limiting, and the fast commodity/token cadence.
+	tsmHTTPClient := &http.Client{Timeout: config.RequestTimeout}
+	tsmClients := make([]*scraper.TSMClient, 0, len(config.Regions))
+	for _, region := range config.Regions {
+		tsmClients = append(tsmClients, scraper.NewTSMClient(tsmHTTPClient, region))
+	}
+
+	blizzardLoop := scraper.NewScraper(pool, clients, logger, config)
+	tsmLoop := scraper.NewTSMScraper(pool, tsmClients, logger, config)
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error { return blizzardLoop.Run(groupCtx) })
+	group.Go(func() error { return tsmLoop.Run(groupCtx) })
+	return group.Wait()
 }
