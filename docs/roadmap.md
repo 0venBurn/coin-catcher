@@ -35,7 +35,16 @@ Homelab                         CoinCatcher
                                 5 GitOps cutover of the rewrite
 ```
 
-Pickup now: Homelab `RAN-135` / `RAN-145` (storage inventory) and CoinCatcher `RAN-140` / `RAN-153` (verify the live scraper). Tunnel starts after storage. Rewrite (`RAN-141`, children `RAN-164`–`RAN-175`) stays in backlog until storage and SSH are done.
+Tickets are **vertical slices**: each one demos an outcome and the next slice adds a capability. Layered work (config-only, httptest-only, “write tests later”) was folded in.
+
+Pickup now:
+
+- [RAN-146](https://linear.app/evanbyrnecodingprojects/issue/RAN-146) — TimescaleDB on a durable path, survives reboot
+- [RAN-153](https://linear.app/evanbyrnecodingprojects/issue/RAN-153) — live scraper healthy + baseline
+
+Then restore drill (`RAN-147`), then you-can-SSH (`RAN-149`) and friend SSH (`RAN-152`). Rewrite slices on `RAN-141` stay blocked until storage and SSH are done. The rewrite path is:
+
+1. Process starts → 2. Print live token prices → 3. Persist/poll tokens → 4. EU auctions → 5. US + limiter → 6. TSM → 7. Item names → 8. Craft catalog → 9. Docker soak
 
 ## Guardrails
 
