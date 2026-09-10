@@ -8,12 +8,16 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const tsmBaseURL = "https://public-data.tradeskillmaster.com/retail"
+const (
+	tsmBaseURL    = "https://public-data.tradeskillmaster.com/retail"
+	tsmMaxRetries = 3
+)
 
 var tsmCSVHeader = []string{"itemId", "name", "marketValue", "historical", "avgSalePrice", "saleRate", "soldPerDay", "updatedAt"}
 
@@ -49,15 +53,12 @@ type TSMClient struct {
 	httpClient *http.Client
 	region     string
 	baseURL    string
-	maxRetries int
 	retryDelay time.Duration
 }
 
 func NewTSMClient(httpClient *http.Client, region string) *TSMClient {
-	return &TSMClient{httpClient: httpClient, region: region, baseURL: tsmBaseURL, maxRetries: 3, retryDelay: time.Second}
+	return &TSMClient{httpClient: httpClient, region: region, baseURL: tsmBaseURL, retryDelay: time.Second}
 }
-
-func (c *TSMClient) Region() string { return c.region }
 
 // Fetch sends validators directly on GET. A 200 body is parsed row-by-row and
 // always closed; a 304 returns without attempting CSV decoding.
@@ -81,7 +82,7 @@ func (c *TSMClient) Fetch(ctx context.Context, validators TSMValidators, consume
 	if err != nil {
 		return TSMFetchResult{}, fmt.Errorf("read TSM CSV header: %w", err)
 	}
-	if !equalStrings(header, tsmCSVHeader) {
+	if !slices.Equal(header, tsmCSVHeader) {
 		return TSMFetchResult{}, fmt.Errorf("unexpected TSM CSV header: %q", header)
 	}
 	for line := 2; ; line++ {
@@ -114,7 +115,7 @@ func (c *TSMClient) Fetch(ctx context.Context, validators TSMValidators, consume
 
 func (c *TSMClient) getWithRetry(ctx context.Context, validators TSMValidators) (*http.Response, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+	for attempt := 0; attempt <= tsmMaxRetries; attempt++ {
 		if attempt > 0 {
 			delay := time.Duration(1<<(attempt-1)) * c.retryDelay
 			timer := time.NewTimer(delay)
@@ -126,7 +127,7 @@ func (c *TSMClient) getWithRetry(ctx context.Context, validators TSMValidators) 
 			}
 		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet,
-			fmt.Sprintf("%s/%s/region/items.csv", strings.TrimRight(c.baseURL, "/"), c.region), nil)
+			fmt.Sprintf("%s/%s/region/items.csv", c.baseURL, c.region), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -215,16 +216,4 @@ func parseTSMItem(record []string) (TSMItem, error) {
 		name = &value
 	}
 	return TSMItem{int32(itemID), name, market, historical, average, saleRate, sold, updated.UTC()}, nil
-}
-
-func equalStrings(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
 }

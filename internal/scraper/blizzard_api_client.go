@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const OAuthTokenURL = "https://oauth.battle.net/token"
+const oauthTokenURL = "https://oauth.battle.net/token"
 
 // APIRateLimiter spaces requests evenly at a fixed requests-per-second pace.
 // Blizzard throttles by request rate, so a steady drip avoids bursts that a
@@ -100,7 +100,7 @@ func (c *BlizzardClient) tokenFor(ctx context.Context) (string, error) {
 
 	form := url.Values{"grant_type": {"client_credentials"}}.Encode()
 	response, err := c.do(ctx, func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, OAuthTokenURL, strings.NewReader(form))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthTokenURL, strings.NewReader(form))
 		if err == nil {
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			req.SetBasicAuth(c.clientID, c.clientSecret)
@@ -129,12 +129,13 @@ func (c *BlizzardClient) apiRequest(ctx context.Context, method, path, namespace
 	if err != nil {
 		return nil, err
 	}
-	if query == nil {
-		query = url.Values{}
+	params := url.Values{}
+	for key, values := range query {
+		params[key] = values
 	}
-	query.Set("namespace", namespace+"-"+c.region)
-	query.Set("locale", "en_US")
-	u := url.URL{Scheme: "https", Host: c.apiHost, Path: path, RawQuery: query.Encode()}
+	params.Set("namespace", namespace+"-"+c.region)
+	params.Set("locale", "en_US")
+	u := url.URL{Scheme: "https", Host: c.apiHost, Path: path, RawQuery: params.Encode()}
 	return c.do(ctx, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 		if err == nil {
@@ -149,14 +150,6 @@ func (c *BlizzardClient) apiRequest(ctx context.Context, method, path, namespace
 
 func (c *BlizzardClient) Region() string {
 	return c.region
-}
-
-// Ping verifies credentials and outbound connectivity against the region's
-// dynamic API host, including the token endpoint polled on every tick. The
-// static host is exercised moments later by the seeder.
-func (c *BlizzardClient) Ping(ctx context.Context) error {
-	_, err := c.GetTokenIndex(ctx)
-	return err
 }
 
 // GetTokenIndex fetches the current WoW Token price for the region.

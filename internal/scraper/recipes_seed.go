@@ -29,14 +29,6 @@ type recipeJob struct {
 	recipeID     int
 }
 
-// recipeFetchResult carries either a fetched recipe or the error that ended
-// its worker; errors travel through the same channel so the consumer can
-// drain cleanly before unwinding.
-type recipeFetchResult struct {
-	record recipeSeedRecord
-	err    error
-}
-
 // seedRecipesAndReagents runs the final seed stage in two phases: a serial
 // listing pass builds the tier/category hierarchy and the deduped job list,
 // then a bounded worker pool fetches recipe details while the main goroutine
@@ -95,7 +87,7 @@ func (s *Seeder) seedRecipesAndReagents(ctx context.Context) error {
 	defer cancel()
 	g, gctx := errgroup.WithContext(workCtx)
 	jobsCh := make(chan recipeJob)
-	results := make(chan recipeFetchResult, recipeSeedBatchSize)
+	results := make(chan recipeSeedRecord, recipeSeedBatchSize)
 
 	g.Go(func() error {
 		defer close(jobsCh)
@@ -113,15 +105,10 @@ func (s *Seeder) seedRecipesAndReagents(ctx context.Context) error {
 			for job := range jobsCh {
 				recipe, err := s.client.GetRecipe(gctx, job.recipeID)
 				if err != nil {
-					result := recipeFetchResult{err: fmt.Errorf("get recipe %d: %w", job.recipeID, err)}
-					select {
-					case results <- result:
-					case <-gctx.Done():
-					}
-					return result.err
+					return fmt.Errorf("get recipe %d: %w", job.recipeID, err)
 				}
 				select {
-				case results <- recipeFetchResult{record: recipeSeedRecord{job: job, recipe: recipe}}:
+				case results <- recipeSeedRecord{job: job, recipe: recipe}:
 				case <-gctx.Done():
 					return gctx.Err()
 				}
@@ -129,8 +116,9 @@ func (s *Seeder) seedRecipesAndReagents(ctx context.Context) error {
 			return nil
 		})
 	}
+	waitErr := make(chan error, 1)
 	go func() {
-		_ = g.Wait()
+		waitErr <- g.Wait()
 		close(results)
 	}()
 
@@ -153,21 +141,8 @@ func (s *Seeder) seedRecipesAndReagents(ctx context.Context) error {
 		return nil
 	}
 
-	var fetchErr error
-	for result := range results {
-		if result.err != nil {
-			// Keep only the first fetch error; later ones are duplicates of
-			// the same unwind. Draining continues so no worker blocks on a
-			// full results channel.
-			if fetchErr == nil {
-				fetchErr = result.err
-			}
-			continue
-		}
-		if fetchErr != nil {
-			continue
-		}
-		batch = append(batch, result.record)
+	for record := range results {
+		batch = append(batch, record)
 		if len(batch) == recipeSeedBatchSize {
 			if err := flush(); err != nil {
 				cancel()
@@ -175,10 +150,10 @@ func (s *Seeder) seedRecipesAndReagents(ctx context.Context) error {
 			}
 		}
 	}
-	if fetchErr != nil {
-		return fetchErr
-	}
 	if err := flush(); err != nil {
+		return err
+	}
+	if err := <-waitErr; err != nil {
 		return err
 	}
 	if err := s.markCompleted(ctx, "recipes", recipeCount); err != nil {
@@ -227,7 +202,7 @@ func (s *Seeder) storeRecipeHierarchy(ctx context.Context, tierRows, categoryRow
 // form or one side of an Alliance/Horde pair.
 type recipeVariant struct {
 	faction       string
-	craftedItemID any
+	craftedItemID *int
 }
 
 // recipeVariants expands one recipe into its faction rows: neutral-only,
@@ -245,11 +220,11 @@ func recipeVariants(recipe RecipeResponse) ([]recipeVariant, error) {
 	case hasAlliance != hasHorde:
 		return nil, fmt.Errorf("recipe %d has only one faction-specific crafted item", recipe.ID)
 	case hasGeneric:
-		return []recipeVariant{{faction: "Neutral", craftedItemID: recipe.CraftedItem.ID}}, nil
+		return []recipeVariant{{faction: "Neutral", craftedItemID: &recipe.CraftedItem.ID}}, nil
 	case hasAlliance:
 		return []recipeVariant{
-			{faction: "Alliance", craftedItemID: recipe.AllianceCraftedItem.ID},
-			{faction: "Horde", craftedItemID: recipe.HordeCraftedItem.ID},
+			{faction: "Alliance", craftedItemID: &recipe.AllianceCraftedItem.ID},
+			{faction: "Horde", craftedItemID: &recipe.HordeCraftedItem.ID},
 		}, nil
 	default:
 		// Output-less recipes are common for enchanting and other recipes whose
@@ -300,20 +275,18 @@ func (s *Seeder) storeRecipeBatch(ctx context.Context, records []recipeSeedRecor
 			itemReferences[reagent.Reagent.ID] = reagent.Reagent.Name
 		}
 
-		var rank, mediaID, craftedQuantity any
-		if recipe.Rank != nil {
-			rank = *recipe.Rank
-		}
+		var mediaID *int
 		if recipe.Media != nil {
-			mediaID = recipe.Media.ID
+			mediaID = &recipe.Media.ID
 		}
+		var craftedQuantity *float64
 		if recipe.CraftedQuantity != nil {
-			craftedQuantity = recipe.CraftedQuantity.Value
+			craftedQuantity = &recipe.CraftedQuantity.Value
 		}
 
 		for _, variant := range variants {
 			recipeRows = append(recipeRows, []any{
-				recipe.ID, variant.faction, recipe.Name, recipe.Description, rank, mediaID,
+				recipe.ID, variant.faction, recipe.Name, recipe.Description, recipe.Rank, mediaID,
 				record.job.professionID, record.job.tierID, record.job.category,
 				variant.craftedItemID, craftedQuantity,
 			})

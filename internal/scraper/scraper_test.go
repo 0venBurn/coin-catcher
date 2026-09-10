@@ -14,6 +14,27 @@ import (
 	"time"
 )
 
+func TestWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if wait(ctx, time.Hour) {
+		t.Fatal("cancelled wait reported success")
+	}
+	if !wait(context.Background(), time.Millisecond) {
+		t.Fatal("short wait failed")
+	}
+}
+
+func TestLogTime(t *testing.T) {
+	if got := logTime(time.Time{}); got != "never" {
+		t.Fatalf("zero logTime = %q", got)
+	}
+	ts := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC)
+	if got := logTime(ts); got != "2026-09-10T12:00:00Z" {
+		t.Fatalf("logTime = %q", got)
+	}
+}
+
 func TestWarnIfStale(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))

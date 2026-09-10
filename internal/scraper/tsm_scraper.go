@@ -35,33 +35,17 @@ type TSMScraper struct {
 	log        *slog.Logger
 	schedule   Schedule
 	pollWindow time.Duration
-	now        func() time.Time
-	wait       func(context.Context, time.Duration) bool
-	jitter     func(time.Duration) time.Duration
 }
 
 func NewTSMScraper(pool *pgxpool.Pool, clients []*TSMClient, logger *slog.Logger, config Config) *TSMScraper {
 	return &TSMScraper{
 		pool: pool, clients: clients, log: logger, schedule: config.Schedule, pollWindow: config.TSMPollWindow,
-		now: time.Now,
-		wait: func(ctx context.Context, duration time.Duration) bool {
-			timer := time.NewTimer(duration)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return false
-			case <-timer.C:
-				return true
-			}
-		},
-		jitter: func(max time.Duration) time.Duration { return time.Duration(rand.Int64N(int64(max) + 1)) },
 	}
 }
 
 func (s *TSMScraper) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for _, client := range s.clients {
-		client := client
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -73,10 +57,10 @@ func (s *TSMScraper) Run(ctx context.Context) error {
 }
 
 func (s *TSMScraper) runRegion(ctx context.Context, client *TSMClient) {
-	if delay := s.schedule.StartAt.Sub(s.now()); delay > 0 && !s.wait(ctx, delay) {
+	if delay := time.Until(s.schedule.StartAt); delay > 0 && !wait(ctx, delay) {
 		return
 	}
-	if !s.schedule.StopAt.IsZero() && !s.schedule.StopAt.After(s.now()) {
+	if !s.schedule.StopAt.IsZero() && !s.schedule.StopAt.After(time.Now()) {
 		return
 	}
 
@@ -86,9 +70,9 @@ func (s *TSMScraper) runRegion(ctx context.Context, client *TSMClient) {
 		return
 	}
 	for {
-		started := s.now()
+		started := time.Now()
 		result, err := s.storeSnapshot(ctx, client, state)
-		duration := s.now().Sub(started)
+		duration := time.Since(started)
 		switch {
 		case errors.Is(err, errTSMSnapshotNotNewer):
 			s.log.Info("TSM snapshot not newer", "region", client.region, "source_updated_at", state.sourceAt, "duration", duration)
@@ -105,13 +89,13 @@ func (s *TSMScraper) runRegion(ctx context.Context, client *TSMClient) {
 			s.log.Info("TSM snapshot stored", "region", client.region, "rows", result.Rows, "source_updated_at", result.UpdatedAt,
 				"etag", result.ETag, "last_modified", result.LastModified, "duration", duration)
 		}
-		s.warnIfTSMStale(client.region, state, s.now())
+		s.warnIfTSMStale(client.region, state, time.Now())
 
-		delay := s.pollWindow + s.jitter(tsmMaximumJitter)
-		if !s.schedule.StopAt.IsZero() && !s.now().Add(delay).Before(s.schedule.StopAt) {
+		delay := s.pollWindow + time.Duration(rand.Int64N(int64(tsmMaximumJitter)+1))
+		if !s.schedule.StopAt.IsZero() && !time.Now().Add(delay).Before(s.schedule.StopAt) {
 			return
 		}
-		if !s.wait(ctx, delay) {
+		if !wait(ctx, delay) {
 			return
 		}
 	}
@@ -161,7 +145,7 @@ func (s *TSMScraper) storeSnapshot(ctx context.Context, client *TSMClient, state
 		return nil
 	}
 
-	ingestedAt := s.now().UTC()
+	ingestedAt := time.Now().UTC()
 	seen := make(map[int32]struct{}, 100_000)
 	batch := make([]TSMItem, 0, tsmCopyBatchSize)
 	flush := func() error {
@@ -202,7 +186,7 @@ func (s *TSMScraper) storeSnapshot(ctx context.Context, client *TSMClient, state
 	if err != nil {
 		return TSMFetchResult{}, err
 	}
-	polledAt := s.now().UTC()
+	polledAt := time.Now().UTC()
 	if !result.Changed {
 		if err := ensureTx(); err != nil {
 			return TSMFetchResult{}, err
@@ -221,10 +205,20 @@ func (s *TSMScraper) storeSnapshot(ctx context.Context, client *TSMClient, state
 	if err := flush(); err != nil {
 		return TSMFetchResult{}, err
 	}
+	if err := ensureTx(); err != nil {
+		return TSMFetchResult{}, err
+	}
+	var etag, lastModified *string
+	if result.ETag != "" {
+		etag = &result.ETag
+	}
+	if result.LastModified != "" {
+		lastModified = &result.LastModified
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO tsm_region_item_state (region, etag, last_modified, last_source_updated_at, last_successful_poll)
 		VALUES ($1,$2,$3,$4,$5) ON CONFLICT (region) DO UPDATE SET etag=EXCLUDED.etag, last_modified=EXCLUDED.last_modified,
 		last_source_updated_at=EXCLUDED.last_source_updated_at, last_successful_poll=EXCLUDED.last_successful_poll, updated_at=NOW()`,
-		client.region, nullableString(result.ETag), nullableString(result.LastModified), result.UpdatedAt, polledAt)
+		client.region, etag, lastModified, result.UpdatedAt, polledAt)
 	if err != nil {
 		return TSMFetchResult{}, fmt.Errorf("update TSM state: %w", err)
 	}
@@ -233,13 +227,6 @@ func (s *TSMScraper) storeSnapshot(ctx context.Context, client *TSMClient, state
 	}
 	tx = nil
 	return result, nil
-}
-
-func nullableString(value string) any {
-	if value == "" {
-		return nil
-	}
-	return value
 }
 
 func (s *TSMScraper) warnIfTSMStale(region string, state *tsmState, now time.Time) {
