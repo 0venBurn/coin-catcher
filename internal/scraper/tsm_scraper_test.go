@@ -3,41 +3,29 @@ package scraper
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestTSMSchedulerUsesInjectedClockWaitAndJitter(t *testing.T) {
-	base := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
-	now := base
-	var waits []time.Duration
-	s := &TSMScraper{
-		pollWindow: time.Hour,
-		now:        func() time.Time { return now },
-		wait: func(_ context.Context, duration time.Duration) bool {
-			waits = append(waits, duration)
-			now = now.Add(duration)
-			return true
-		},
-		jitter: func(max time.Duration) time.Duration {
-			if max != 5*time.Minute {
-				t.Fatalf("jitter max = %s", max)
-			}
-			return 3 * time.Minute
-		},
-	}
-	// Exercise scheduler dependencies directly: startup has no wait; recurring
-	// polls use the configured window plus bounded injected jitter.
-	if delay := s.schedule.StartAt.Sub(s.now()); delay > 0 {
-		s.wait(context.Background(), delay)
-	}
-	delay := s.pollWindow + s.jitter(tsmMaximumJitter)
-	s.wait(context.Background(), delay)
-	if len(waits) != 1 || waits[0] != 63*time.Minute {
-		t.Fatalf("waits = %v", waits)
-	}
+func TestTSMRunRegionExitsWhenScheduleAlreadyEnded(t *testing.T) {
+	s := NewTSMScraper(nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
+		Schedule:      Schedule{StopAt: time.Now().Add(-time.Minute)},
+		TSMPollWindow: time.Hour,
+	})
+	s.runRegion(context.Background(), NewTSMClient(nil, "eu"))
+}
+
+func TestTSMRunRegionExitsWhenStartWaitCancelled(t *testing.T) {
+	s := NewTSMScraper(nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
+		Schedule:      Schedule{StartAt: time.Now().Add(time.Hour)},
+		TSMPollWindow: time.Hour,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.runRegion(ctx, NewTSMClient(nil, "eu"))
 }
 
 func TestTSMStaleWarningIsBounded(t *testing.T) {

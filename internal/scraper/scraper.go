@@ -2,6 +2,7 @@ package scraper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -33,14 +34,10 @@ func NewScraper(pool *pgxpool.Pool, clients []*BlizzardClient, logger *slog.Logg
 // POLL_WINDOW until the window closes or the context is cancelled, writing
 // snapshots whenever the upstream data changes.
 func (s *Scraper) Run(ctx context.Context) error {
-	if s.schedule.StartAt.After(time.Now()) {
+	if delay := time.Until(s.schedule.StartAt); delay > 0 {
 		s.log.Info("waiting for scraping to begin", "starts_at", s.schedule.StartAt, "stops_at", logTime(s.schedule.StopAt))
-		timer := time.NewTimer(time.Until(s.schedule.StartAt))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		if !wait(ctx, delay) {
 			return nil
-		case <-timer.C:
 		}
 	}
 	if !s.schedule.StopAt.IsZero() && !s.schedule.StopAt.After(time.Now()) {
@@ -70,13 +67,21 @@ func (s *Scraper) Run(ctx context.Context) error {
 			s.log.Info("scrape period ended", "ended_at", s.schedule.StopAt)
 			return nil
 		}
-		timer := time.NewTimer(s.pollWindow)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		if !wait(ctx, s.pollWindow) {
 			return nil
-		case <-timer.C:
 		}
+	}
+}
+
+// wait sleeps until duration elapses, or returns false if ctx is cancelled.
+func wait(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -106,7 +111,7 @@ func (s *Scraper) loadRegionState(ctx context.Context, region string) (*regionSt
 	var tokenUpdated *time.Time
 	err := s.pool.QueryRow(ctx, sqlLoadRegionState, region).
 		Scan(&lastModified, &tokenUpdated)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return &regionState{}, nil
 	}
 	if err != nil {
@@ -204,13 +209,12 @@ func (s *Scraper) warnIfStale(region string, rg *regionState, now time.Time) {
 	s.log.Warn("commodity data stale", "region", region, "stale_for", stale.Round(time.Second))
 }
 
-// logTime formats a possibly-zero time for logging: zero renders as
-// "never" (string) instead of a timestamp. Deliberate any-return for slog.
-func logTime(t time.Time) any {
+// logTime formats a possibly-zero time for logging: zero renders as "never".
+func logTime(t time.Time) string {
 	if t.IsZero() {
 		return "never"
 	}
-	return t
+	return t.Format(time.RFC3339)
 }
 
 // snapshotCopyBatchSize is the streaming COPY batch size: large enough that

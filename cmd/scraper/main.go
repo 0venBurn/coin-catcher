@@ -96,7 +96,7 @@ func run(logger *slog.Logger) error {
 	// Polling starts only after every regional endpoint answers, so outbound
 	// connectivity and credentials are proven before the first snapshot.
 	for _, client := range clients {
-		if err := client.Ping(ctx); err != nil {
+		if _, err := client.GetTokenIndex(ctx); err != nil {
 			return fmt.Errorf("ping %s endpoints: %w", client.Region(), err)
 		}
 		logger.Info("blizzard api reachable", "region", client.Region())
@@ -104,10 +104,9 @@ func run(logger *slog.Logger) error {
 
 	// TSM public CSV polling is deliberately separate from Blizzard OAuth,
 	// rate limiting, and the fast commodity/token cadence.
-	tsmHTTPClient := &http.Client{Timeout: config.RequestTimeout}
 	tsmClients := make([]*scraper.TSMClient, 0, len(config.Regions))
 	for _, region := range config.Regions {
-		tsmClients = append(tsmClients, scraper.NewTSMClient(tsmHTTPClient, region))
+		tsmClients = append(tsmClients, scraper.NewTSMClient(httpClient, region))
 	}
 
 	blizzardLoop := scraper.NewScraper(pool, clients, logger, config)

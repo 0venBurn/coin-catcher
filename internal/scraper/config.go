@@ -54,13 +54,17 @@ func LoadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("load %s: %w", envFile, err)
 	}
 
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = "postgres://coin_catcher:coin_catcher@localhost:5432/coin_catcher?sslmode=disable"
+	}
 	// Defaults chosen for one container polling two regions well under
 	// Blizzard's limits: 20 req/s matches the documented commodity cap,
 	// 2 minutes covers slow streaming commodity responses.
 	config := Config{
 		ClientID:             os.Getenv("CLIENT_ID"),
 		ClientSecret:         os.Getenv("CLIENT_SECRET"),
-		DatabaseURL:          valueOrDefault("DATABASE_URL", "postgres://coin_catcher:coin_catcher@localhost:5432/coin_catcher?sslmode=disable"),
+		DatabaseURL:          databaseURL,
 		Regions:              []string{"eu", "us"},
 		PollWindow:           30 * time.Second,
 		TSMPollWindow:        time.Hour,
@@ -123,14 +127,6 @@ func resolveSchedule(now time.Time, pollStart, pollEnd time.Duration, scrapeFrom
 		stopAt = scrapeUntil
 	}
 	return Schedule{StartAt: startAt, StopAt: stopAt}
-}
-
-// valueOrDefault returns the env value or fallback when unset/empty.
-func valueOrDefault(name, fallback string) string {
-	if value := os.Getenv(name); value != "" {
-		return value
-	}
-	return fallback
 }
 
 // envDuration parses a Go duration; empty/unset yields fallback. Values below

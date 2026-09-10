@@ -7,6 +7,7 @@ import (
 
 func TestRecipeVariants(t *testing.T) {
 	item := func(id int) *APIReference { return &APIReference{ID: id} }
+	id := func(v int) *int { return &v }
 	tests := []struct {
 		name    string
 		recipe  RecipeResponse
@@ -16,7 +17,7 @@ func TestRecipeVariants(t *testing.T) {
 		{
 			name:   "generic output",
 			recipe: RecipeResponse{ID: 1, CraftedItem: item(10)},
-			want:   []recipeVariant{{faction: "Neutral", craftedItemID: 10}},
+			want:   []recipeVariant{{faction: "Neutral", craftedItemID: id(10)}},
 		},
 		{
 			name: "faction outputs",
@@ -24,8 +25,8 @@ func TestRecipeVariants(t *testing.T) {
 				ID: 2, AllianceCraftedItem: item(20), HordeCraftedItem: item(21),
 			},
 			want: []recipeVariant{
-				{faction: "Alliance", craftedItemID: 20},
-				{faction: "Horde", craftedItemID: 21},
+				{faction: "Alliance", craftedItemID: id(20)},
+				{faction: "Horde", craftedItemID: id(21)},
 			},
 		},
 		{
@@ -63,7 +64,14 @@ func TestRecipeVariants(t *testing.T) {
 				t.Fatalf("recipeVariants() = %#v, want %#v", got, test.want)
 			}
 			for i := range got {
-				if got[i].faction != test.want[i].faction || got[i].craftedItemID != test.want[i].craftedItemID {
+				if got[i].faction != test.want[i].faction {
+					t.Fatalf("recipeVariants() = %#v, want %#v", got, test.want)
+				}
+				switch {
+				case got[i].craftedItemID == nil && test.want[i].craftedItemID == nil:
+				case got[i].craftedItemID != nil && test.want[i].craftedItemID != nil &&
+					*got[i].craftedItemID == *test.want[i].craftedItemID:
+				default:
 					t.Fatalf("recipeVariants() = %#v, want %#v", got, test.want)
 				}
 			}

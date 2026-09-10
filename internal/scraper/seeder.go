@@ -2,6 +2,7 @@ package scraper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -120,11 +121,10 @@ func (s *Seeder) seedItems(ctx context.Context) error {
 		}
 		for _, result := range page.Results {
 			item := result.Data
-			// inventoryType is nullable upstream; typed nil keeps the COPY
-			// column NULL instead of the string "<nil>".
-			var inventoryType any
+			var inventoryType *string
 			if item.InventoryType != nil {
-				inventoryType = item.InventoryType.Name.English()
+				name := item.InventoryType.Name.English()
+				inventoryType = &name
 			}
 			rows = append(rows, []any{
 				item.ID, item.Name.English(), item.Level, item.ItemClass.Name.English(),
@@ -165,9 +165,9 @@ func (s *Seeder) seedProfessions(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("get profession %d: %w", ref.ID, err)
 		}
-		var mediaID any
+		var mediaID *int
 		if detail.Media != nil {
-			mediaID = detail.Media.ID
+			mediaID = &detail.Media.ID
 		}
 		professionRows = append(professionRows, []any{
 			detail.ID, detail.Name, detail.Description, detail.Type.Type, detail.Type.Name, mediaID,
@@ -214,7 +214,7 @@ func (s *Seeder) seedProfessions(ctx context.Context) error {
 func (s *Seeder) completed(ctx context.Context, name string) (bool, error) {
 	var completed bool
 	err := s.pool.QueryRow(ctx, `SELECT completed FROM seeder_status WHERE seeder_type=$1`, name).Scan(&completed)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
