@@ -1,0 +1,11 @@
+{
+  "name": "Coin Catcher",
+  "install": "bash .cursor/install.sh",
+  "start": "bash .cursor/start.sh",
+  "ports": [
+    {
+      "name": "timescaledb",
+      "port": 5432
+    }
+  ]
+}

@@ -177,6 +177,14 @@ cython_debug/
 .vscode/
 .cursor/
 
+# Track the Cursor Cloud Agent dev-environment config while ignoring the rest
+# of .cursor/ (editor state, indexes, etc.).
+!.cursor/
+.cursor/*
+!.cursor/environment.json
+!.cursor/install.sh
+!.cursor/start.sh
+
 # Abstra
 # Abstra is an AI-powered process automation framework.
 # Ignore directories containing user credentials, local state, and settings.
